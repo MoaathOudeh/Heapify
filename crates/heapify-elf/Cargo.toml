@@ -1,0 +1,10 @@
+[package]
+name = "heapify-elf"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+object = { version = "0.36", default-features = false, features = ["read", "elf", "std"] }

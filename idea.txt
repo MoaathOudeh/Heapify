@@ -1,0 +1,33 @@
++-------------------+
+| Target binary     |
++-------------------+
+          |
+          v
++-------------------+
+| Execution engine  |  <- runs/debugs/traces the program
++-------------------+
+          |
+          v
++-------------------+
+| Event collector   |  <- malloc/free/realloc/calloc events
++-------------------+
+          |
+          v
++-------------------+
+| Heap model        |  <- reconstructs chunks, bins, tcache, arenas
++-------------------+
+          |
+          v
++-------------------+
+| Visualizer        |  <- CLI first, GUI later
++-------------------+
+
+
+
+Execution tracing layer
+        |
+        v
+Allocator-specific parser/model
+        |
+        v
+Generic heap visualization data model
