@@ -112,6 +112,7 @@ Useful keys:
 - `n`: continue to the next allocator event and pause again.
 - `c`: continue normally.
 - `Tab`: cycle focus.
+- `:`: open the command console.
 - `j`/`k` or arrows: move or scroll the focused pane.
 - `g`: jump in the heap pane.
 - `i`: toggle chunk inspector.
@@ -120,6 +121,27 @@ Useful keys:
 
 The live TUI is read-only over target memory. `n` is allocator-event stepping,
 not instruction, source, or disassembly stepping.
+
+The live TUI uses a debugger-style shell layout. The left column contains
+registers, code context, allocator trace, and a console/status pane. The right
+column has tabs for heap, stack, logs, and maps. Use `1`/`2`/`3`/`4` to switch
+right tabs, or `[` and `]` to move between them. The heap tab contains the
+existing heap layout, allocator/scan summary, related records, and chunk
+inspector. The registers pane shows the latest register snapshot, marks changed
+registers after each stop/event, and adds best-effort address classifications
+for values that look like heap, stack, code, libc, loader, or mapped-file
+pointers. The code pane shows the current RIP, best-effort symbol/source/object
+context, and an explicit disassembly placeholder. The stack tab shows a
+read-only memory snapshot around RSP and uses the same best-effort address
+classification. The maps tab shows `/proc/<pid>/maps`-style memory mappings.
+Address classification is evidence for inspection, not proof that a value is a
+valid pointer.
+
+The command console starts with a small command set that maps to existing live
+TUI actions: `help`, `continue`, `pause`, `resume`, `next`, `stop`, `regs`,
+`stack`, `maps`, `heap ADDR`, `jump ADDR`, and `tab NAME`. Expression
+evaluation, memory editing, register editing, and instruction stepping are not
+implemented.
 
 ## Allocator Views
 
@@ -238,9 +260,8 @@ The JSON trace format is alpha and not yet a stable public API. See
 - Dynamically linked targets are the practical path.
 - Allocator metadata is best-effort.
 - Profile-backed views depend on profile confidence.
-- No register pane yet.
-- No stack pane yet.
-- No disassembly or source stepping yet.
+- No stack unwinding or backtrace yet.
+- No real disassembly, instruction stepping, or source stepping yet.
 - No memory editing.
 - No expression evaluator.
 - No watchpoints.
@@ -272,8 +293,21 @@ smoke scripts, and project organization.
 v0.81 introduces register snapshot plumbing for live debugger stops. Full
 register panes and instruction stepping remain future work.
 
+v0.82 and v0.83 add the live debugger shell layout and register pane. v0.84
+adds code-context plumbing and a code pane with RIP, symbol/source/object
+fields, and a disassembly placeholder. Real disassembly, source views, and
+instruction/source stepping remain future work.
+
+v0.85 adds read-only stack snapshot plumbing and a stack tab around RSP, with
+best-effort heap/code pointer annotations. Stack unwinding, backtraces, memory
+editing, watchpoints, and general memory browsing remain future work.
+
+v0.86 adds a read-only maps tab and centralizes best-effort address
+classification for registers and stack values. Memory browsing/editing,
+watchpoints, and instruction stepping remain future work.
+
 Near-term work is expected to focus on reliability of existing heap and
 allocator views, trace compatibility, diagnostics quality, and UI clarity. Full
-debugger features such as registers, stack inspection, disassembly/source
+debugger features such as stack unwinding/backtraces, real disassembly/source
 stepping, watchpoints, memory editing, and expression evaluation are future
 work, not part of this milestone.

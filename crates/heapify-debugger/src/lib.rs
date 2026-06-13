@@ -96,9 +96,110 @@ pub fn format_register_value_hex(value: u64) -> String {
     format!("0x{value:x}")
 }
 
+pub const DEFAULT_STACK_SNAPSHOT_WORDS: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackSnapshot {
+    pub stack_pointer: u64,
+    pub word_size: u8,
+    pub words: Vec<StackWord>,
+    pub truncated: bool,
+    pub read_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackWord {
+    pub offset_from_sp: i64,
+    pub address: u64,
+    pub value: u64,
+    pub annotation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessMapEntry {
+    pub start: u64,
+    pub end: u64,
+    pub permissions: String,
+    pub offset: u64,
+    pub device: Option<String>,
+    pub inode: Option<u64>,
+    pub pathname: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessMapsSnapshot {
+    pub entries: Vec<ProcessMapEntry>,
+}
+
 pub fn read_register_snapshot(pid: Pid) -> Result<RegisterSnapshot> {
     let regs = ptrace::getregs(pid).context("failed to read child registers")?;
     Ok(register_snapshot_from_x86_64_regs(regs))
+}
+
+pub fn read_process_maps_snapshot(pid: Pid) -> Result<ProcessMapsSnapshot> {
+    Ok(ProcessMapsSnapshot {
+        entries: read_process_maps(pid)?
+            .into_iter()
+            .map(ProcessMapEntry::from)
+            .collect(),
+    })
+}
+
+impl From<MemoryMapping> for ProcessMapEntry {
+    fn from(mapping: MemoryMapping) -> Self {
+        Self {
+            start: mapping.start,
+            end: mapping.end,
+            permissions: mapping.permissions,
+            offset: mapping.offset,
+            device: Some(mapping.dev),
+            inode: Some(mapping.inode),
+            pathname: mapping.pathname,
+        }
+    }
+}
+
+pub fn read_stack_snapshot(pid: Pid, stack_pointer: u64, word_count: usize) -> StackSnapshot {
+    read_stack_snapshot_with_reader(stack_pointer, word_count, |addr| read_word(pid, addr))
+}
+
+fn read_stack_snapshot_with_reader(
+    stack_pointer: u64,
+    word_count: usize,
+    mut read_word: impl FnMut(u64) -> Result<u64>,
+) -> StackSnapshot {
+    let mut snapshot = StackSnapshot {
+        stack_pointer,
+        word_size: 8,
+        words: Vec::with_capacity(word_count),
+        truncated: false,
+        read_error: None,
+    };
+
+    for index in 0..word_count {
+        let offset = (index as u64).saturating_mul(8);
+        let Some(address) = stack_pointer.checked_add(offset) else {
+            snapshot.truncated = true;
+            snapshot.read_error = Some("stack address overflow".to_string());
+            break;
+        };
+
+        match read_word(address) {
+            Ok(value) => snapshot.words.push(StackWord {
+                offset_from_sp: offset as i64,
+                address,
+                value,
+                annotation: None,
+            }),
+            Err(err) => {
+                snapshot.truncated = true;
+                snapshot.read_error = Some(err.to_string());
+                break;
+            }
+        }
+    }
+
+    snapshot
 }
 
 fn register_snapshot_from_x86_64_regs(regs: libc::user_regs_struct) -> RegisterSnapshot {
@@ -603,6 +704,8 @@ pub struct TraceSessionContext {
     pub glibc_profile: GlibcProfile,
     pub glibc_profile_selection: GlibcProfileSelection,
     pub launch: ExecPlan,
+    pub process_maps: Option<ProcessMapsSnapshot>,
+    pub process_maps_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1061,7 +1164,7 @@ where
         stdin,
         || None,
         |_, _, _, _, _| Ok(()),
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
         TraceWaitMode::Blocking,
     )
 }
@@ -1099,7 +1202,7 @@ where
         LiveTargetStatus,
         String,
     ) -> Result<()>,
-    R: FnMut(Option<usize>, RegisterSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
 {
     trace_heap_with_status_mode_profile_session_control(
         program,
@@ -1159,7 +1262,7 @@ where
         LiveTargetStatus,
         String,
     ) -> Result<()>,
-    R: FnMut(Option<usize>, RegisterSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
 {
     let launch_config = LaunchConfig {
         target_program: PathBuf::from(program),
@@ -1383,7 +1486,7 @@ where
         LiveTargetStatus,
         String,
     ) -> Result<()>,
-    R: FnMut(Option<usize>, RegisterSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
 {
     wait_for_initial_stop_with_status(child, show_status)?;
     let program_path = exec_plan
@@ -1413,12 +1516,18 @@ where
             print_libc_metadata(libc_metadata);
         }
     }
+    let (process_maps, process_maps_error) = match read_process_maps_snapshot(child) {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
     on_session(TraceSessionContext {
         pid: child,
         libc: libc_metadata.clone(),
         glibc_profile,
         glibc_profile_selection: glibc_profile_selection.clone(),
         launch: exec_plan.clone(),
+        process_maps,
+        process_maps_error,
     })?;
 
     let symbols = resolve_allocation_symbols(
@@ -1577,6 +1686,15 @@ where
             WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {
                 let emitted_allocator_event =
                     handle_managed_breakpoint_hit(child, &mut breakpoints, &mut state)?;
+                if let Some((event_id, _)) = emitted_allocator_event {
+                    emit_register_snapshot_best_effort(
+                        child,
+                        Some(event_id),
+                        &mut on_register_snapshot,
+                        &mut on_control_status,
+                        target_status,
+                    )?;
+                }
                 if matches!(wait_mode, TraceWaitMode::Controlled) {
                     if let Some((event_id, event_control)) = emitted_allocator_event {
                         if should_pause_after_allocator_event(run_mode, event_control) {
@@ -1890,7 +2008,7 @@ fn emit_register_snapshot_best_effort<R, T>(
     target_status: LiveTargetStatus,
 ) -> Result<()>
 where
-    R: FnMut(Option<usize>, RegisterSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
     T: FnMut(
         Option<LiveCommandId>,
         Option<LiveCommand>,
@@ -1900,7 +2018,11 @@ where
     ) -> Result<()>,
 {
     match read_register_snapshot(child) {
-        Ok(snapshot) => on_register_snapshot(event_id, snapshot),
+        Ok(snapshot) => {
+            let stack_snapshot =
+                read_stack_snapshot(child, snapshot.stack_pointer, DEFAULT_STACK_SNAPSHOT_WORDS);
+            on_register_snapshot(event_id, snapshot, stack_snapshot)
+        }
         Err(err) => on_control_status(
             None,
             None,
@@ -4687,6 +4809,32 @@ mod tests {
         assert_eq!(role("r9"), Some(RegisterRole::Argument));
         assert_eq!(role("eflags"), Some(RegisterRole::Flags));
         assert_eq!(role("rbx"), Some(RegisterRole::General));
+    }
+
+    #[test]
+    fn stack_snapshot_reader_collects_words_until_error() {
+        let snapshot =
+            super::read_stack_snapshot_with_reader(0x7fffffffdc30, 4, |addr| match addr {
+                0x7fffffffdc30 => Ok(0x1111),
+                0x7fffffffdc38 => Ok(0x2222),
+                _ => anyhow::bail!("read failed"),
+            });
+
+        assert_eq!(snapshot.stack_pointer, 0x7fffffffdc30);
+        assert_eq!(snapshot.word_size, 8);
+        assert_eq!(snapshot.words.len(), 2);
+        assert_eq!(snapshot.words[0].offset_from_sp, 0);
+        assert_eq!(snapshot.words[0].address, 0x7fffffffdc30);
+        assert_eq!(snapshot.words[0].value, 0x1111);
+        assert_eq!(snapshot.words[1].offset_from_sp, 8);
+        assert_eq!(snapshot.words[1].address, 0x7fffffffdc38);
+        assert_eq!(snapshot.words[1].value, 0x2222);
+        assert!(snapshot.truncated);
+        assert!(snapshot
+            .read_error
+            .as_deref()
+            .unwrap()
+            .contains("read failed"));
     }
 
     #[test]

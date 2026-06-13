@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -47,9 +47,9 @@ use heapify_core::tracker::{
 use heapify_core::HeapTraceEvent;
 use heapify_debugger::{
     validate_live_command, AllocationTraceMode, AllocatorEventControl, LiveCommand, LiveCommandId,
-    LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, ProcessSymbolizer, RegisterSnapshot,
-    SourceLocation, StdinConfig, SymbolizedAddress, TargetCommand, TargetSourceMapper,
-    TraceHeapContext,
+    LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, ProcessMapEntry, ProcessMapsSnapshot,
+    ProcessSymbolizer, RegisterRole, RegisterSnapshot, SourceLocation, StackSnapshot, StackWord,
+    StdinConfig, SymbolizedAddress, TargetCommand, TargetSourceMapper, TraceHeapContext,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -304,9 +304,20 @@ pub enum LiveTraceUpdate {
         target_status: LiveTargetStatus,
         message: String,
     },
+    ProcessMaps {
+        snapshot: ProcessMapsSnapshot,
+    },
     RegisterSnapshot {
         event_id: Option<usize>,
         snapshot: RegisterSnapshot,
+    },
+    StackSnapshot {
+        event_id: Option<usize>,
+        snapshot: StackSnapshot,
+    },
+    CodeContext {
+        event_id: Option<usize>,
+        context: CodeContext,
     },
     BreakMatched(AllocatorBreakMatch),
     SessionEnd(JsonSessionEnd),
@@ -364,7 +375,10 @@ impl LiveTraceSink for CurrentOutputSink<'_> {
             }
             LiveTraceUpdate::Status { .. }
             | LiveTraceUpdate::CommandStatus { .. }
-            | LiveTraceUpdate::RegisterSnapshot { .. } => {}
+            | LiveTraceUpdate::ProcessMaps { .. }
+            | LiveTraceUpdate::RegisterSnapshot { .. }
+            | LiveTraceUpdate::StackSnapshot { .. }
+            | LiveTraceUpdate::CodeContext { .. } => {}
             LiveTraceUpdate::BreakMatched(break_match) => {
                 if self.json_writer.is_none() {
                     println!(
@@ -440,7 +454,10 @@ fn write_live_update_json(writer: &mut JsonWriter, update: &LiveTraceUpdate) -> 
         LiveTraceUpdate::RelatedRecord { record, .. } => writer.write_record(record)?,
         LiveTraceUpdate::Status { .. }
         | LiveTraceUpdate::CommandStatus { .. }
+        | LiveTraceUpdate::ProcessMaps { .. }
         | LiveTraceUpdate::RegisterSnapshot { .. }
+        | LiveTraceUpdate::StackSnapshot { .. }
+        | LiveTraceUpdate::CodeContext { .. }
         | LiveTraceUpdate::BreakMatched(_) => {}
         LiveTraceUpdate::SessionEnd(session) => {
             writer.write_record(&session.record)?;
@@ -449,19 +466,6 @@ fn write_live_update_json(writer: &mut JsonWriter, update: &LiveTraceUpdate) -> 
     }
 
     Ok(())
-}
-
-fn emit_register_snapshot_update(
-    sink: &mut dyn LiveTraceSink,
-    event_id: Option<usize>,
-    context: &TraceHeapContext,
-) -> Result<()> {
-    match heapify_debugger::read_register_snapshot(context.pid) {
-        Ok(snapshot) => sink.on_update(&LiveTraceUpdate::RegisterSnapshot { event_id, snapshot }),
-        Err(err) => sink.on_update(&LiveTraceUpdate::Status {
-            message: format!("register snapshot failed: {err}"),
-        }),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -486,12 +490,26 @@ pub struct LiveTuiApp {
     pub latest_allocator_warnings: Option<json::JsonTraceRecord>,
     pub latest_heap_scan: Option<json::JsonTraceRecord>,
     pub latest_register_snapshot: Option<RegisterSnapshot>,
+    pub previous_register_snapshot: Option<RegisterSnapshot>,
+    pub changed_registers: BTreeSet<String>,
     pub register_snapshots_by_event_id: BTreeMap<usize, RegisterSnapshot>,
+    pub latest_code_context: Option<CodeContext>,
+    pub code_context_by_event_id: BTreeMap<usize, CodeContext>,
+    pub latest_stack_snapshot: Option<StackSnapshot>,
+    pub stack_snapshots_by_event_id: BTreeMap<usize, StackSnapshot>,
+    pub latest_process_maps: Option<ProcessMapsSnapshot>,
+    pub focused_debugger_pane: LiveDebuggerPane,
+    pub active_right_tab: LiveRightTab,
+    pub logs: VecDeque<String>,
     pub focused_pane: LiveTuiPane,
+    pub register_pane_scroll: usize,
+    pub code_pane_scroll: usize,
     pub event_details_scroll: usize,
     pub heap_layout_scroll: usize,
     pub allocator_scan_scroll: usize,
     pub related_records_scroll: usize,
+    pub stack_tab_scroll: usize,
+    pub maps_tab_scroll: usize,
     pub selected_chunk_index: Option<usize>,
     pub selected_chunk_addr: Option<u64>,
     pub selected_chunk_user_addr: Option<u64>,
@@ -500,8 +518,115 @@ pub struct LiveTuiApp {
     pub search_prompt_active: bool,
     pub search_prompt_input: String,
     pub search_status: Option<String>,
+    pub console_input_active: bool,
+    pub console_input: String,
+    pub console_history: Vec<String>,
+    pub console_history_index: Option<usize>,
     pub show_heap_pane: bool,
     pub show_scan_pane: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveDebuggerPane {
+    Registers,
+    Code,
+    Trace,
+    Console,
+    RightTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveRightTab {
+    Heap,
+    Stack,
+    Logs,
+    Maps,
+}
+
+impl LiveRightTab {
+    fn label(self) -> &'static str {
+        match self {
+            LiveRightTab::Heap => "heap",
+            LiveRightTab::Stack => "stack",
+            LiveRightTab::Logs => "logs",
+            LiveRightTab::Maps => "maps",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedRegisterLine {
+    pub name: String,
+    pub value: String,
+    pub role: Option<RegisterRole>,
+    pub changed: bool,
+    pub annotation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeContext {
+    pub instruction_pointer: u64,
+    pub symbol: Option<String>,
+    pub symbol_addr: Option<u64>,
+    pub symbol_offset: Option<u64>,
+    pub object: Option<String>,
+    pub source: Option<SourceLocation>,
+    pub disassembly: Vec<DisassemblyLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisassemblyLine {
+    pub address: u64,
+    pub text: String,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressRegionKind {
+    Heap,
+    Stack,
+    Code,
+    Libc,
+    Loader,
+    MappedFile,
+    Anonymous,
+    Vdso,
+    Vvar,
+    Vsvar,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeapAddressDetail {
+    ChunkHeader {
+        chunk_addr: u64,
+        user_addr: u64,
+    },
+    UserPointer {
+        chunk_addr: u64,
+        user_addr: u64,
+    },
+    Interior {
+        chunk_addr: u64,
+        user_addr: u64,
+        offset: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressClassification {
+    pub address: u64,
+    pub kind: AddressRegionKind,
+    pub label: String,
+    pub map: Option<ProcessMapEntry>,
+    pub heap_detail: Option<HeapAddressDetail>,
+    pub symbol: Option<String>,
+}
+
+impl AddressClassification {
+    pub fn short_label(&self) -> &str {
+        &self.label
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,6 +645,22 @@ pub enum HeapSearchQuery {
     Size(u64),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleCommand {
+    Help,
+    Continue,
+    Pause,
+    Resume,
+    NextAllocatorEvent,
+    Stop,
+    Registers,
+    Stack,
+    Maps,
+    HeapJump(HeapSearchQuery),
+    SelectRightTab(LiveRightTab),
+    Unknown(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveTuiPane {
     Events,
@@ -527,18 +668,6 @@ pub enum LiveTuiPane {
     HeapLayout,
     AllocatorScan,
     RelatedRecords,
-}
-
-impl LiveTuiPane {
-    fn label(self) -> &'static str {
-        match self {
-            LiveTuiPane::Events => "events",
-            LiveTuiPane::EventDetails => "event details",
-            LiveTuiPane::HeapLayout => "heap layout",
-            LiveTuiPane::AllocatorScan => "allocator/scan",
-            LiveTuiPane::RelatedRecords => "related records",
-        }
-    }
 }
 
 impl Default for LiveTuiApp {
@@ -564,12 +693,26 @@ impl Default for LiveTuiApp {
             latest_allocator_warnings: None,
             latest_heap_scan: None,
             latest_register_snapshot: None,
+            previous_register_snapshot: None,
+            changed_registers: BTreeSet::new(),
             register_snapshots_by_event_id: BTreeMap::new(),
+            latest_code_context: None,
+            code_context_by_event_id: BTreeMap::new(),
+            latest_stack_snapshot: None,
+            stack_snapshots_by_event_id: BTreeMap::new(),
+            latest_process_maps: None,
+            focused_debugger_pane: LiveDebuggerPane::Trace,
+            active_right_tab: LiveRightTab::Heap,
+            logs: VecDeque::new(),
             focused_pane: LiveTuiPane::Events,
+            register_pane_scroll: 0,
+            code_pane_scroll: 0,
             event_details_scroll: 0,
             heap_layout_scroll: 0,
             allocator_scan_scroll: 0,
             related_records_scroll: 0,
+            stack_tab_scroll: 0,
+            maps_tab_scroll: 0,
             selected_chunk_index: None,
             selected_chunk_addr: None,
             selected_chunk_user_addr: None,
@@ -578,6 +721,10 @@ impl Default for LiveTuiApp {
             search_prompt_active: false,
             search_prompt_input: String::new(),
             search_status: None,
+            console_input_active: false,
+            console_input: String::new(),
+            console_history: Vec::new(),
+            console_history_index: None,
             show_heap_pane: true,
             show_scan_pane: true,
         }
@@ -590,6 +737,7 @@ impl LiveTuiApp {
             LiveTraceUpdate::SessionStart(session) => {
                 self.session_start = Some(session);
                 self.status_line = "tracing...".to_string();
+                self.push_log_line("session started");
             }
             LiveTraceUpdate::Event {
                 event,
@@ -623,6 +771,7 @@ impl LiveTuiApp {
                     .push(record);
             }
             LiveTraceUpdate::Status { message } => {
+                self.push_log_line(message.clone());
                 self.status_line = message;
             }
             LiveTraceUpdate::CommandStatus {
@@ -634,11 +783,37 @@ impl LiveTuiApp {
             } => {
                 self.apply_command_status(command, status, target_status, message);
             }
+            LiveTraceUpdate::ProcessMaps { snapshot } => {
+                self.latest_process_maps = Some(snapshot);
+            }
             LiveTraceUpdate::RegisterSnapshot { event_id, snapshot } => {
+                let previous = self.latest_register_snapshot.clone();
+                self.changed_registers = diff_register_snapshots(previous.as_ref(), &snapshot);
+                self.previous_register_snapshot = previous;
                 self.latest_register_snapshot = Some(snapshot.clone());
                 if let Some(event_id) = event_id {
                     self.register_snapshots_by_event_id
                         .insert(event_id, snapshot);
+                }
+            }
+            LiveTraceUpdate::StackSnapshot { event_id, snapshot } => {
+                let snapshot = annotate_stack_snapshot(
+                    snapshot,
+                    self.latest_process_maps.as_ref(),
+                    self.latest_heap_layout.as_ref(),
+                    self.latest_register_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.instruction_pointer),
+                );
+                self.latest_stack_snapshot = Some(snapshot.clone());
+                if let Some(event_id) = event_id {
+                    self.stack_snapshots_by_event_id.insert(event_id, snapshot);
+                }
+            }
+            LiveTraceUpdate::CodeContext { event_id, context } => {
+                self.latest_code_context = Some(context.clone());
+                if let Some(event_id) = event_id {
+                    self.code_context_by_event_id.insert(event_id, context);
                 }
             }
             LiveTraceUpdate::BreakMatched(break_match) => {
@@ -656,9 +831,22 @@ impl LiveTuiApp {
                 self.target_status = LiveTargetStatus::Exited;
                 self.status_line =
                     format!("target exited: {exit_status}; {event_count} events; press q to quit");
+                self.push_log_line(self.status_line.clone());
             }
         }
         self.clamp_scrolls_to_content();
+    }
+
+    fn push_log_line(&mut self, line: impl Into<String>) {
+        const MAX_LOG_LINES: usize = 200;
+        self.logs.push_back(line.into());
+        while self.logs.len() > MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+    }
+
+    fn push_console_output(&mut self, line: impl Into<String>) {
+        self.push_log_line(line);
     }
 
     fn selected_event_record(&self) -> Option<&json::JsonTraceRecord> {
@@ -726,6 +914,12 @@ impl LiveTuiApp {
             self.follow_tail = false;
         }
         self.status_line = message;
+        let command = command.map(LiveCommand::as_str).unwrap_or("target");
+        self.push_log_line(format!(
+            "{command}: {} ({})",
+            self.status_line,
+            status.as_str()
+        ));
     }
 
     fn apply_break_match(&mut self, break_match: AllocatorBreakMatch) {
@@ -737,6 +931,7 @@ impl LiveTuiApp {
             "break condition matched: {} after event #{}",
             break_match.message, break_match.event_id
         );
+        self.push_log_line(self.status_line.clone());
         if let Some(index) = self
             .events
             .iter()
@@ -751,6 +946,8 @@ impl LiveTuiApp {
             {
                 self.select_chunk_index(index);
                 self.focused_pane = LiveTuiPane::HeapLayout;
+                self.focused_debugger_pane = LiveDebuggerPane::RightTab;
+                self.active_right_tab = LiveRightTab::Heap;
                 self.show_heap_pane = true;
                 self.show_chunk_inspector = true;
                 self.heap_layout_scroll = index.saturating_sub(3);
@@ -759,6 +956,7 @@ impl LiveTuiApp {
         self.last_break_match = Some(break_match);
     }
 
+    #[cfg(test)]
     fn inspection_mode(&self) -> bool {
         self.target_status == LiveTargetStatus::Paused
     }
@@ -786,43 +984,6 @@ impl LiveTuiApp {
         Ok(message)
     }
 
-    fn footer_text(&self) -> String {
-        if self.search_prompt_active {
-            return format!("jump> {}", self.search_prompt_input);
-        }
-
-        let help = if self.inspection_mode() {
-            "inspection mode | n next event | c continue | Space/r resume | q stop | Tab focus | j/k scroll | PgUp/PgDn | h heap | s scan | g jump"
-        } else {
-            "Space pause/resume | c continue | Tab focus | j/k move/scroll | PgUp/PgDn | f follow | h heap | s scan | g jump | p pause | r resume | q stop/quit"
-        };
-        let last = match (self.last_command, self.last_command_status) {
-            (Some(command), Some(status)) => {
-                format!("{}:{}", command.as_str(), status.as_str())
-            }
-            _ => "none".to_string(),
-        };
-        let message = self
-            .search_status
-            .as_deref()
-            .or_else(|| {
-                self.last_break_match
-                    .as_ref()
-                    .map(|_| self.status_line.as_str())
-            })
-            .or(self.last_command_message.as_deref())
-            .unwrap_or(self.status_line.as_str());
-        format!(
-            "target={} | follow={} | last={} | {} | focus: {} | {}",
-            self.target_status.as_str(),
-            if self.follow_tail { "on" } else { "off" },
-            last,
-            message,
-            self.focused_pane.label(),
-            help
-        )
-    }
-
     fn apply_latest_related_record(&mut self, record: &json::JsonTraceRecord) {
         match record {
             json::JsonTraceRecord::HeapLayout { .. } => {
@@ -846,86 +1007,119 @@ impl LiveTuiApp {
     }
 
     fn focus_next_pane(&mut self) {
-        self.focused_pane = next_live_tui_pane(self.focused_pane, self.visible_panes(), 1);
+        self.focused_debugger_pane = next_live_debugger_pane(self.focused_debugger_pane, 1);
+        self.sync_legacy_focus_from_debugger_pane();
     }
 
     fn focus_previous_pane(&mut self) {
-        self.focused_pane = next_live_tui_pane(self.focused_pane, self.visible_panes(), -1);
-    }
-
-    fn visible_panes(&self) -> Vec<LiveTuiPane> {
-        let mut panes = vec![
-            LiveTuiPane::Events,
-            LiveTuiPane::EventDetails,
-            LiveTuiPane::RelatedRecords,
-        ];
-        if self.show_heap_pane {
-            panes.push(LiveTuiPane::HeapLayout);
-        }
-        if self.show_scan_pane {
-            panes.push(LiveTuiPane::AllocatorScan);
-        }
-        panes
+        self.focused_debugger_pane = next_live_debugger_pane(self.focused_debugger_pane, -1);
+        self.sync_legacy_focus_from_debugger_pane();
     }
 
     fn ensure_focus_visible(&mut self) {
-        if !self.visible_panes().contains(&self.focused_pane) {
-            self.focused_pane = LiveTuiPane::Events;
-        }
+        self.sync_legacy_focus_from_debugger_pane();
     }
 
     fn scroll_focused(&mut self, amount: isize) {
-        match self.focused_pane {
-            LiveTuiPane::Events => {}
-            LiveTuiPane::EventDetails => {
-                self.event_details_scroll = scroll_delta(self.event_details_scroll, amount);
+        match self.focused_debugger_pane {
+            LiveDebuggerPane::Registers => {
+                self.register_pane_scroll = scroll_delta(self.register_pane_scroll, amount);
             }
-            LiveTuiPane::HeapLayout => {
-                self.heap_layout_scroll = scroll_delta(self.heap_layout_scroll, amount);
+            LiveDebuggerPane::Trace => {}
+            LiveDebuggerPane::Code => {
+                self.code_pane_scroll = scroll_delta(self.code_pane_scroll, amount);
             }
-            LiveTuiPane::AllocatorScan => {
-                self.allocator_scan_scroll = scroll_delta(self.allocator_scan_scroll, amount);
-            }
-            LiveTuiPane::RelatedRecords => {
-                if self.show_chunk_inspector {
-                    self.chunk_inspector_scroll = scroll_delta(self.chunk_inspector_scroll, amount);
-                } else {
+            LiveDebuggerPane::RightTab => match self.active_right_tab {
+                LiveRightTab::Heap => {
+                    if self.show_chunk_inspector {
+                        self.chunk_inspector_scroll =
+                            scroll_delta(self.chunk_inspector_scroll, amount);
+                    } else {
+                        self.heap_layout_scroll = scroll_delta(self.heap_layout_scroll, amount);
+                    }
+                }
+                LiveRightTab::Logs => {
                     self.related_records_scroll = scroll_delta(self.related_records_scroll, amount);
                 }
-            }
+                LiveRightTab::Stack => {
+                    self.stack_tab_scroll = scroll_delta(self.stack_tab_scroll, amount);
+                }
+                LiveRightTab::Maps => {
+                    self.maps_tab_scroll = scroll_delta(self.maps_tab_scroll, amount);
+                }
+            },
+            LiveDebuggerPane::Console => {}
         }
     }
 
     fn scroll_focused_top(&mut self) {
-        match self.focused_pane {
-            LiveTuiPane::Events => self.select_first(),
-            LiveTuiPane::EventDetails => self.event_details_scroll = 0,
-            LiveTuiPane::HeapLayout => self.heap_layout_scroll = 0,
-            LiveTuiPane::AllocatorScan => self.allocator_scan_scroll = 0,
-            LiveTuiPane::RelatedRecords => {
-                if self.show_chunk_inspector {
+        match self.focused_debugger_pane {
+            LiveDebuggerPane::Registers => self.register_pane_scroll = 0,
+            LiveDebuggerPane::Trace => self.select_first(),
+            LiveDebuggerPane::Code => self.code_pane_scroll = 0,
+            LiveDebuggerPane::RightTab => match self.active_right_tab {
+                LiveRightTab::Heap => {
+                    self.heap_layout_scroll = 0;
+                    self.allocator_scan_scroll = 0;
                     self.chunk_inspector_scroll = 0;
-                } else {
-                    self.related_records_scroll = 0;
                 }
-            }
+                LiveRightTab::Logs => self.related_records_scroll = 0,
+                LiveRightTab::Stack => self.stack_tab_scroll = 0,
+                LiveRightTab::Maps => self.maps_tab_scroll = 0,
+            },
+            LiveDebuggerPane::Console => {}
         }
     }
 
     fn scroll_focused_bottom(&mut self) {
-        match self.focused_pane {
-            LiveTuiPane::Events => self.select_latest(),
-            LiveTuiPane::EventDetails => self.event_details_scroll = usize::MAX,
-            LiveTuiPane::HeapLayout => self.heap_layout_scroll = usize::MAX,
-            LiveTuiPane::AllocatorScan => self.allocator_scan_scroll = usize::MAX,
-            LiveTuiPane::RelatedRecords => {
-                if self.show_chunk_inspector {
+        match self.focused_debugger_pane {
+            LiveDebuggerPane::Registers => self.register_pane_scroll = usize::MAX,
+            LiveDebuggerPane::Trace => self.select_latest(),
+            LiveDebuggerPane::Code => self.code_pane_scroll = usize::MAX,
+            LiveDebuggerPane::RightTab => match self.active_right_tab {
+                LiveRightTab::Heap => {
+                    self.heap_layout_scroll = usize::MAX;
+                    self.allocator_scan_scroll = usize::MAX;
                     self.chunk_inspector_scroll = usize::MAX;
-                } else {
-                    self.related_records_scroll = usize::MAX;
                 }
-            }
+                LiveRightTab::Logs => self.related_records_scroll = usize::MAX,
+                LiveRightTab::Stack => self.stack_tab_scroll = usize::MAX,
+                LiveRightTab::Maps => self.maps_tab_scroll = usize::MAX,
+            },
+            LiveDebuggerPane::Console => {}
         }
+    }
+
+    fn sync_legacy_focus_from_debugger_pane(&mut self) {
+        self.focused_pane = match self.focused_debugger_pane {
+            LiveDebuggerPane::Registers | LiveDebuggerPane::Trace | LiveDebuggerPane::Console => {
+                LiveTuiPane::Events
+            }
+            LiveDebuggerPane::Code => LiveTuiPane::EventDetails,
+            LiveDebuggerPane::RightTab => match self.active_right_tab {
+                LiveRightTab::Heap => LiveTuiPane::HeapLayout,
+                LiveRightTab::Logs => LiveTuiPane::RelatedRecords,
+                LiveRightTab::Stack | LiveRightTab::Maps => LiveTuiPane::Events,
+            },
+        };
+    }
+
+    fn set_active_right_tab(&mut self, tab: LiveRightTab) {
+        self.active_right_tab = tab;
+        self.focused_debugger_pane = LiveDebuggerPane::RightTab;
+        self.sync_legacy_focus_from_debugger_pane();
+    }
+
+    fn next_right_tab(&mut self) {
+        self.active_right_tab = next_live_right_tab(self.active_right_tab, 1);
+        self.focused_debugger_pane = LiveDebuggerPane::RightTab;
+        self.sync_legacy_focus_from_debugger_pane();
+    }
+
+    fn previous_right_tab(&mut self) {
+        self.active_right_tab = next_live_right_tab(self.active_right_tab, -1);
+        self.focused_debugger_pane = LiveDebuggerPane::RightTab;
+        self.sync_legacy_focus_from_debugger_pane();
     }
 
     fn reset_selection_scrolls(&mut self) {
@@ -934,6 +1128,16 @@ impl LiveTuiApp {
     }
 
     fn clamp_scrolls_to_content(&mut self) {
+        self.register_pane_scroll = clamp_scroll(
+            self.register_pane_scroll,
+            format_live_registers_pane(self).lines().count(),
+            1,
+        );
+        self.code_pane_scroll = clamp_scroll(
+            self.code_pane_scroll,
+            format_live_code_context(self).lines().count(),
+            1,
+        );
         self.event_details_scroll = clamp_scroll(
             self.event_details_scroll,
             live_event_details_text(self, &ReplayConfig::default())
@@ -958,6 +1162,16 @@ impl LiveTuiApp {
             live_related_records_text(self, &ReplayConfig::default())
                 .lines()
                 .count(),
+            1,
+        );
+        self.stack_tab_scroll = clamp_scroll(
+            self.stack_tab_scroll,
+            format_live_stack_tab(self).lines().count(),
+            1,
+        );
+        self.maps_tab_scroll = clamp_scroll(
+            self.maps_tab_scroll,
+            format_live_maps_tab(self).lines().count(),
             1,
         );
         self.chunk_inspector_scroll = clamp_scroll(
@@ -1061,6 +1275,68 @@ impl LiveTuiApp {
         self.selected_chunk_user_addr = None;
     }
 
+    fn start_console_input(&mut self) {
+        self.console_input_active = true;
+        self.console_input.clear();
+        self.console_history_index = None;
+        self.focused_debugger_pane = LiveDebuggerPane::Console;
+        self.sync_legacy_focus_from_debugger_pane();
+    }
+
+    fn cancel_console_input(&mut self) {
+        self.console_input_active = false;
+        self.console_input.clear();
+        self.console_history_index = None;
+    }
+
+    fn push_console_char(&mut self, ch: char) {
+        self.console_input.push(ch);
+    }
+
+    fn pop_console_char(&mut self) {
+        self.console_input.pop();
+    }
+
+    fn history_previous(&mut self) {
+        if self.console_history.is_empty() {
+            return;
+        }
+        let index = self
+            .console_history_index
+            .map(|index| index.saturating_sub(1))
+            .unwrap_or_else(|| self.console_history.len().saturating_sub(1));
+        self.console_history_index = Some(index);
+        self.console_input = self.console_history[index].clone();
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.console_history_index else {
+            return;
+        };
+        if index + 1 >= self.console_history.len() {
+            self.console_history_index = None;
+            self.console_input.clear();
+        } else {
+            let index = index + 1;
+            self.console_history_index = Some(index);
+            self.console_input = self.console_history[index].clone();
+        }
+    }
+
+    fn remember_console_command(&mut self, command: &str) {
+        if command.is_empty() {
+            return;
+        }
+        if self
+            .console_history
+            .last()
+            .is_some_and(|previous| previous == command)
+        {
+            return;
+        }
+        self.console_history.push(command.to_string());
+    }
+
     fn start_heap_search_prompt(&mut self) {
         self.search_prompt_active = true;
         self.search_prompt_input.clear();
@@ -1091,6 +1367,10 @@ impl LiveTuiApp {
             }
         };
 
+        self.execute_heap_search_query(query);
+    }
+
+    fn execute_heap_search_query(&mut self, query: HeapSearchQuery) {
         let Some(json::JsonTraceRecord::HeapLayout { .. }) = self.latest_heap_layout.as_ref()
         else {
             self.search_prompt_active = false;
@@ -1124,6 +1404,8 @@ impl LiveTuiApp {
     fn jump_to_chunk_index(&mut self, index: usize) {
         self.select_chunk_index(index);
         self.focused_pane = LiveTuiPane::HeapLayout;
+        self.focused_debugger_pane = LiveDebuggerPane::RightTab;
+        self.active_right_tab = LiveRightTab::Heap;
         self.show_heap_pane = true;
         self.show_chunk_inspector = true;
         self.heap_layout_scroll = index.saturating_sub(3);
@@ -1505,11 +1787,6 @@ fn run_trace_heap_worker(
                             &mut previous_allocator_source_summary,
                             caller_symbol,
                         )?;
-                        emit_register_snapshot_update(
-                            &mut sink,
-                            Some(heap_event_id(&event)),
-                            &context,
-                        )?;
                         if let Some(break_match) = evaluate_allocator_break_conditions(
                             &config.break_conditions,
                             &event,
@@ -1589,7 +1866,7 @@ fn run_trace_heap_worker(
                         session.glibc_profile.name,
                         None,
                         Some(session.glibc_profile_selection.clone()),
-                        session.libc.map(json_libc_metadata),
+                        session.libc.clone().map(json_libc_metadata),
                         Some(json_launch_metadata(&session.launch)),
                         config.allocator_views_preset.as_str(),
                         json_trace_features(&config, trace_mode),
@@ -1602,6 +1879,13 @@ fn run_trace_heap_worker(
                             json_writer: json_writer.as_mut(),
                         };
                         sink.on_update(&update)?;
+                        if let Some(snapshot) = session.process_maps.clone() {
+                            sink.on_update(&LiveTraceUpdate::ProcessMaps { snapshot })?;
+                        } else if let Some(error) = session.process_maps_error.as_ref() {
+                            sink.on_update(&LiveTraceUpdate::Status {
+                                message: format!("process maps read failed: {error}"),
+                            })?;
+                        }
                     } else {
                         let mut sink = CurrentOutputSink {
                             config: &config,
@@ -1625,10 +1909,22 @@ fn run_trace_heap_worker(
                 config.stdin.clone(),
                 poll_control,
                 on_control_status,
-                |event_id, snapshot| {
+                |event_id, snapshot, stack_snapshot| {
                     if let Some(sender) = &live_sender {
+                        let target_symbolizer = target_symbolizer.borrow();
+                        let target_source_mapper = target_source_mapper.borrow();
+                        let context = build_code_context(
+                            snapshot.instruction_pointer,
+                            target_symbolizer.as_ref(),
+                            target_source_mapper.as_ref(),
+                        );
                         let _ =
                             sender.send(LiveTraceUpdate::RegisterSnapshot { event_id, snapshot });
+                        let _ = sender.send(LiveTraceUpdate::StackSnapshot {
+                            event_id,
+                            snapshot: stack_snapshot,
+                        });
+                        let _ = sender.send(LiveTraceUpdate::CodeContext { event_id, context });
                     }
                     Ok(())
                 },
@@ -1715,7 +2011,7 @@ fn run_trace_heap_worker(
                         session.glibc_profile.name,
                         None,
                         Some(session.glibc_profile_selection.clone()),
-                        session.libc.map(json_libc_metadata),
+                        session.libc.clone().map(json_libc_metadata),
                         Some(json_launch_metadata(&session.launch)),
                         config.allocator_views_preset.as_str(),
                         json_trace_features(&config, trace_mode),
@@ -1929,47 +2225,46 @@ fn run_live_tui_loop(
 }
 
 fn draw_live_tui(frame: &mut ratatui::Frame<'_>, app: &LiveTuiApp, config: &ReplayConfig) {
-    let show_extra_panes = frame.size().height >= 24 && frame.size().width >= 80;
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if show_extra_panes {
-            vec![
-                Constraint::Percentage(42),
-                Constraint::Percentage(31),
-                Constraint::Percentage(21),
-                Constraint::Length(3),
-            ]
-        } else {
-            vec![
-                Constraint::Percentage(48),
-                Constraint::Min(3),
-                Constraint::Length(3),
-            ]
-        })
-        .split(frame.size());
-    let top = if show_extra_panes {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(vertical[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(vertical[0])
-    };
-    let detail_area = if show_extra_panes {
-        vertical[1]
-    } else {
-        vertical[1]
-    };
-    let footer_area = if show_extra_panes {
-        vertical[3]
-    } else {
-        vertical[2]
-    };
+    let area = frame.size();
+    if area.width < 80 || area.height < 20 {
+        let message = Paragraph::new("terminal too small for debugger layout")
+            .block(Block::default().title("Heapify").borders(Borders::ALL));
+        frame.render_widget(message, area);
+        return;
+    }
 
-    let timeline_inner_height = top[0].height.saturating_sub(2) as usize;
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(19),
+            Constraint::Percentage(24),
+            Constraint::Percentage(38),
+            Constraint::Min(5),
+        ])
+        .split(columns[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(columns[1]);
+
+    render_live_registers_pane(frame, app, left[0]);
+    render_live_code_pane(frame, app, config, left[1]);
+    render_live_trace_pane(frame, app, left[2]);
+    render_live_console_pane(frame, app, left[3]);
+    render_live_right_tabs(frame, app, right[0]);
+    render_live_right_tab_body(frame, app, config, right[1]);
+}
+
+fn render_live_trace_pane(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let timeline_inner_height = area.height.saturating_sub(2) as usize;
     let timeline_offset =
         visible_timeline_offset(app.selected_index, timeline_inner_height, app.events.len());
     let timeline_items = app
@@ -1994,8 +2289,8 @@ fn draw_live_tui(frame: &mut ratatui::Frame<'_>, app: &LiveTuiApp, config: &Repl
     }
     let timeline = List::new(timeline_items)
         .block(live_tui_block(
-            "Event Timeline",
-            app.focused_pane == LiveTuiPane::Events,
+            "Trace",
+            app.focused_debugger_pane == LiveDebuggerPane::Trace,
         ))
         .highlight_style(
             Style::default()
@@ -2003,129 +2298,293 @@ fn draw_live_tui(frame: &mut ratatui::Frame<'_>, app: &LiveTuiApp, config: &Repl
                 .bg(Color::White)
                 .add_modifier(Modifier::BOLD),
         );
-    frame.render_stateful_widget(timeline, top[0], &mut list_state);
+    frame.render_stateful_widget(timeline, area, &mut list_state);
+}
 
-    let details_text = live_event_details_text(app, config);
+fn render_live_code_pane(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    _config: &ReplayConfig,
+    area: ratatui::layout::Rect,
+) {
+    let details_text = format_live_code_context(app);
     let details_scroll = clamped_scroll_for_text(
         &details_text,
-        app.event_details_scroll,
-        detail_area.height.saturating_sub(2) as usize,
+        app.code_pane_scroll,
+        area.height.saturating_sub(2) as usize,
     );
     let details_title = format!(
-        "Selected Event Details {}",
+        "Code {}",
         format_scroll_indicator(
             details_scroll,
             text_line_count(&details_text),
-            detail_area.height.saturating_sub(2) as usize
+            area.height.saturating_sub(2) as usize
         )
     );
     let details = Paragraph::new(text_from_string(&details_text))
         .block(live_tui_block(
             &details_title,
-            app.focused_pane == LiveTuiPane::EventDetails,
+            app.focused_debugger_pane == LiveDebuggerPane::Code,
         ))
         .scroll((scroll_offset_u16(details_scroll), 0));
-    frame.render_widget(details, detail_area);
+    frame.render_widget(details, area);
+}
 
-    let related_text = if app.show_chunk_inspector {
+fn render_live_registers_pane(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let text = format_live_registers_pane(app);
+    let register_scroll = clamped_scroll_for_text(
+        &text,
+        app.register_pane_scroll,
+        area.height.saturating_sub(2) as usize,
+    );
+    let title = format!(
+        "Registers {}",
+        format_scroll_indicator(
+            register_scroll,
+            text_line_count(&text),
+            area.height.saturating_sub(2) as usize
+        )
+    );
+    let registers = Paragraph::new(text_from_string(&text))
+        .block(live_tui_block(
+            &title,
+            app.focused_debugger_pane == LiveDebuggerPane::Registers,
+        ))
+        .scroll((scroll_offset_u16(register_scroll), 0));
+    frame.render_widget(registers, area);
+}
+
+fn render_live_console_pane(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let text = format_live_console_pane(app, area.height.saturating_sub(2) as usize);
+    let console = Paragraph::new(text_from_string(&text)).block(live_tui_block(
+        "Console",
+        app.focused_debugger_pane == LiveDebuggerPane::Console,
+    ));
+    frame.render_widget(console, area);
+}
+
+fn render_live_right_tabs(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let tabs = [
+        LiveRightTab::Heap,
+        LiveRightTab::Stack,
+        LiveRightTab::Logs,
+        LiveRightTab::Maps,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, tab)| {
+        if tab == app.active_right_tab {
+            format!("[{}:{}]", index + 1, tab.label())
+        } else {
+            format!(" {}:{} ", index + 1, tab.label())
+        }
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+    let block = live_tui_block(
+        "Right Tabs",
+        app.focused_debugger_pane == LiveDebuggerPane::RightTab,
+    );
+    frame.render_widget(Paragraph::new(tabs).block(block), area);
+}
+
+fn render_live_right_tab_body(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    config: &ReplayConfig,
+    area: ratatui::layout::Rect,
+) {
+    match app.active_right_tab {
+        LiveRightTab::Heap => render_live_heap_tab(frame, app, area),
+        LiveRightTab::Stack => render_live_stack_tab(frame, app, area),
+        LiveRightTab::Logs => render_live_logs_tab(frame, app, area),
+        LiveRightTab::Maps => render_live_maps_tab(frame, app, area),
+    }
+
+    let _ = config;
+}
+
+fn render_live_maps_tab(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let text = format_live_maps_tab(app);
+    let scroll = clamped_scroll_for_text(
+        &text,
+        app.maps_tab_scroll,
+        area.height.saturating_sub(2) as usize,
+    );
+    let title = format!(
+        "Maps {}",
+        format_scroll_indicator(
+            scroll,
+            text_line_count(&text),
+            area.height.saturating_sub(2) as usize
+        )
+    );
+    frame.render_widget(
+        Paragraph::new(text_from_string(&text))
+            .block(live_tui_block(
+                &title,
+                app.focused_debugger_pane == LiveDebuggerPane::RightTab
+                    && app.active_right_tab == LiveRightTab::Maps,
+            ))
+            .scroll((scroll_offset_u16(scroll), 0)),
+        area,
+    );
+}
+
+fn render_live_stack_tab(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let text = format_live_stack_tab(app);
+    let scroll = clamped_scroll_for_text(
+        &text,
+        app.stack_tab_scroll,
+        area.height.saturating_sub(2) as usize,
+    );
+    let title = format!(
+        "Stack {}",
+        format_scroll_indicator(
+            scroll,
+            text_line_count(&text),
+            area.height.saturating_sub(2) as usize
+        )
+    );
+    frame.render_widget(
+        Paragraph::new(text_from_string(&text))
+            .block(live_tui_block(
+                &title,
+                app.focused_debugger_pane == LiveDebuggerPane::RightTab
+                    && app.active_right_tab == LiveRightTab::Stack,
+            ))
+            .scroll((scroll_offset_u16(scroll), 0)),
+        area,
+    );
+}
+
+fn render_live_heap_tab(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Min(4),
+        ])
+        .split(area);
+
+    let heap_text = format_live_heap_layout_pane(app, usize::MAX);
+    let heap_scroll = clamped_scroll_for_text(
+        &heap_text,
+        app.heap_layout_scroll,
+        sections[0].height.saturating_sub(2) as usize,
+    );
+    let heap_title = format!(
+        "Heap Layout {}",
+        format_scroll_indicator(
+            heap_scroll,
+            text_line_count(&heap_text),
+            sections[0].height.saturating_sub(2) as usize
+        )
+    );
+    frame.render_widget(
+        Paragraph::new(text_from_string(&heap_text))
+            .block(live_tui_block(
+                &heap_title,
+                app.focused_debugger_pane == LiveDebuggerPane::RightTab
+                    && app.active_right_tab == LiveRightTab::Heap,
+            ))
+            .scroll((scroll_offset_u16(heap_scroll), 0)),
+        sections[0],
+    );
+
+    let allocator_text = format_live_allocator_scan_pane(app);
+    let allocator_scroll = clamped_scroll_for_text(
+        &allocator_text,
+        app.allocator_scan_scroll,
+        sections[1].height.saturating_sub(2) as usize,
+    );
+    frame.render_widget(
+        Paragraph::new(text_from_string(&allocator_text))
+            .block(
+                Block::default()
+                    .title("Allocator / Scan")
+                    .borders(Borders::ALL),
+            )
+            .scroll((scroll_offset_u16(allocator_scroll), 0)),
+        sections[1],
+    );
+
+    let inspector_text = if app.show_chunk_inspector {
         live_chunk_inspector_text(app)
     } else {
-        live_related_records_text(app, config)
+        live_related_records_text(app, &ReplayConfig::default())
     };
-    let related_app_scroll = if app.show_chunk_inspector {
+    let inspector_scroll = if app.show_chunk_inspector {
         app.chunk_inspector_scroll
     } else {
         app.related_records_scroll
     };
-    let related_scroll = clamped_scroll_for_text(
-        &related_text,
-        related_app_scroll,
-        top[1].height.saturating_sub(2) as usize,
+    let inspector_scroll = clamped_scroll_for_text(
+        &inspector_text,
+        inspector_scroll,
+        sections[2].height.saturating_sub(2) as usize,
     );
-    let related_title = format!(
-        "{} {}",
-        if app.show_chunk_inspector {
-            "Chunk Inspector"
-        } else {
-            "Related Records"
-        },
-        format_scroll_indicator(
-            related_scroll,
-            text_line_count(&related_text),
-            top[1].height.saturating_sub(2) as usize
-        )
+    frame.render_widget(
+        Paragraph::new(text_from_string(&inspector_text))
+            .block(
+                Block::default()
+                    .title(if app.show_chunk_inspector {
+                        "Chunk Inspector"
+                    } else {
+                        "Related"
+                    })
+                    .borders(Borders::ALL),
+            )
+            .scroll((scroll_offset_u16(inspector_scroll), 0)),
+        sections[2],
     );
-    let related = Paragraph::new(text_from_string(&related_text))
-        .block(live_tui_block(
-            &related_title,
-            app.focused_pane == LiveTuiPane::RelatedRecords,
-        ))
-        .scroll((scroll_offset_u16(related_scroll), 0));
-    frame.render_widget(related, top[1]);
+}
 
-    if show_extra_panes {
-        let bottom = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(vertical[2]);
-
-        if app.show_heap_pane {
-            let heap_text = format_live_heap_layout_pane(app, usize::MAX);
-            let heap_scroll = clamped_scroll_for_text(
-                &heap_text,
-                app.heap_layout_scroll,
-                bottom[0].height.saturating_sub(2) as usize,
-            );
-            let heap_title = format!(
-                "Latest Heap Layout {}",
-                format_scroll_indicator(
-                    heap_scroll,
-                    text_line_count(&heap_text),
-                    bottom[0].height.saturating_sub(2) as usize
-                )
-            );
-            let heap = Paragraph::new(text_from_string(&heap_text))
-                .block(live_tui_block(
-                    &heap_title,
-                    app.focused_pane == LiveTuiPane::HeapLayout,
-                ))
-                .scroll((scroll_offset_u16(heap_scroll), 0));
-            frame.render_widget(heap, bottom[0]);
-        }
-
-        if app.show_scan_pane {
-            let scan_area = if app.show_heap_pane {
-                bottom[1]
-            } else {
-                bottom[0]
-            };
-            let allocator_text = format_live_allocator_scan_pane(app);
-            let allocator_scroll = clamped_scroll_for_text(
-                &allocator_text,
-                app.allocator_scan_scroll,
-                scan_area.height.saturating_sub(2) as usize,
-            );
-            let allocator_title = format!(
-                "Allocator / Heap Scan {}",
-                format_scroll_indicator(
-                    allocator_scroll,
-                    text_line_count(&allocator_text),
-                    scan_area.height.saturating_sub(2) as usize
-                )
-            );
-            let allocator = Paragraph::new(text_from_string(&allocator_text))
-                .block(live_tui_block(
-                    &allocator_title,
-                    app.focused_pane == LiveTuiPane::AllocatorScan,
-                ))
-                .scroll((scroll_offset_u16(allocator_scroll), 0));
-            frame.render_widget(allocator, scan_area);
-        }
-    }
-
-    let footer = Paragraph::new(app.footer_text())
-        .block(Block::default().title("Status").borders(Borders::ALL));
-    frame.render_widget(footer, footer_area);
+fn render_live_logs_tab(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let text = format_live_logs_pane(app);
+    let scroll = clamped_scroll_for_text(
+        &text,
+        app.related_records_scroll,
+        area.height.saturating_sub(2) as usize,
+    );
+    frame.render_widget(
+        Paragraph::new(text_from_string(&text))
+            .block(live_tui_block(
+                "Logs",
+                app.focused_debugger_pane == LiveDebuggerPane::RightTab,
+            ))
+            .scroll((scroll_offset_u16(scroll), 0)),
+        area,
+    );
 }
 
 fn handle_live_tui_key(
@@ -2137,6 +2596,10 @@ fn handle_live_tui_key(
     if app.search_prompt_active {
         handle_live_tui_search_key(key, app);
         return false;
+    }
+
+    if app.console_input_active {
+        return handle_live_tui_console_key(key, app, input_closed, control_sender);
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -2190,40 +2653,55 @@ fn handle_live_tui_key(
         KeyCode::Char('g') => {
             app.start_heap_search_prompt();
         }
+        KeyCode::Char(':') => {
+            app.start_console_input();
+        }
         KeyCode::Char('f') => {
             app.follow_tail = !app.follow_tail;
             if app.follow_tail {
                 app.select_latest();
             }
         }
+        KeyCode::Char('1') => app.set_active_right_tab(LiveRightTab::Heap),
+        KeyCode::Char('2') => app.set_active_right_tab(LiveRightTab::Stack),
+        KeyCode::Char('3') => app.set_active_right_tab(LiveRightTab::Logs),
+        KeyCode::Char('4') => app.set_active_right_tab(LiveRightTab::Maps),
+        KeyCode::Char('[') => app.previous_right_tab(),
+        KeyCode::Char(']') => app.next_right_tab(),
         KeyCode::Tab => app.focus_next_pane(),
         KeyCode::BackTab => app.focus_previous_pane(),
-        KeyCode::Down | KeyCode::Char('j') => match app.focused_pane {
-            LiveTuiPane::Events => app.select_next(),
-            LiveTuiPane::HeapLayout => app.select_next_chunk(),
+        KeyCode::Down | KeyCode::Char('j') => match app.focused_debugger_pane {
+            LiveDebuggerPane::Trace => app.select_next(),
+            LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Heap => {
+                app.select_next_chunk()
+            }
             _ => app.scroll_focused(1),
         },
-        KeyCode::Up | KeyCode::Char('k') => match app.focused_pane {
-            LiveTuiPane::Events => app.select_previous(),
-            LiveTuiPane::HeapLayout => app.select_previous_chunk(),
+        KeyCode::Up | KeyCode::Char('k') => match app.focused_debugger_pane {
+            LiveDebuggerPane::Trace => app.select_previous(),
+            LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Heap => {
+                app.select_previous_chunk()
+            }
             _ => app.scroll_focused(-1),
         },
         KeyCode::Enter => {
-            if app.focused_pane == LiveTuiPane::HeapLayout {
+            if app.focused_debugger_pane == LiveDebuggerPane::RightTab
+                && app.active_right_tab == LiveRightTab::Heap
+            {
                 app.select_chunk_at_current_layout_index();
                 app.show_chunk_inspector = true;
                 app.chunk_inspector_scroll = 0;
             }
         }
         KeyCode::PageDown => {
-            if app.focused_pane == LiveTuiPane::Events {
+            if app.focused_debugger_pane == LiveDebuggerPane::Trace {
                 app.select_page_down();
             } else {
                 app.scroll_focused(10);
             }
         }
         KeyCode::PageUp => {
-            if app.focused_pane == LiveTuiPane::Events {
+            if app.focused_debugger_pane == LiveDebuggerPane::Trace {
                 app.select_page_up();
             } else {
                 app.scroll_focused(-10);
@@ -2234,6 +2712,124 @@ fn handle_live_tui_key(
         _ => {}
     }
 
+    false
+}
+
+fn handle_live_tui_console_key(
+    key: KeyEvent,
+    app: &mut LiveTuiApp,
+    input_closed: bool,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) -> bool {
+    match key.code {
+        KeyCode::Enter => submit_console_input(app, input_closed, control_sender),
+        KeyCode::Esc => {
+            app.cancel_console_input();
+            false
+        }
+        KeyCode::Backspace => {
+            app.pop_console_char();
+            false
+        }
+        KeyCode::Up => {
+            app.history_previous();
+            false
+        }
+        KeyCode::Down => {
+            app.history_next();
+            false
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            app.push_console_char(ch);
+            false
+        }
+        _ => false,
+    }
+}
+
+fn submit_console_input(
+    app: &mut LiveTuiApp,
+    input_closed: bool,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) -> bool {
+    let input = app.console_input.trim().to_string();
+    app.console_input_active = false;
+    app.console_input.clear();
+    app.console_history_index = None;
+    if input.is_empty() {
+        return false;
+    }
+
+    app.remember_console_command(&input);
+    app.push_console_output(format!("heapify> {input}"));
+    execute_console_command(
+        app,
+        parse_console_command(&input),
+        &input,
+        input_closed,
+        control_sender,
+    )
+}
+
+fn execute_console_command(
+    app: &mut LiveTuiApp,
+    command: ConsoleCommand,
+    raw_input: &str,
+    input_closed: bool,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) -> bool {
+    match command {
+        ConsoleCommand::Help => {
+            app.push_console_output(
+                "commands: help, continue, pause, resume, next, stop, regs, stack, maps, heap ADDR, jump ADDR, tab NAME",
+            );
+        }
+        ConsoleCommand::Continue => {
+            send_console_live_command(app, control_sender, LiveCommand::Continue);
+        }
+        ConsoleCommand::Pause => {
+            send_console_live_command(app, control_sender, LiveCommand::Pause);
+        }
+        ConsoleCommand::Resume => {
+            send_console_live_command(app, control_sender, LiveCommand::Resume);
+        }
+        ConsoleCommand::NextAllocatorEvent => {
+            send_console_live_command(app, control_sender, LiveCommand::StepAllocatorEvent);
+        }
+        ConsoleCommand::Stop => {
+            if app.session_end.is_some() || input_closed {
+                return true;
+            }
+            send_console_live_command(app, control_sender, LiveCommand::Stop);
+        }
+        ConsoleCommand::Registers => {
+            app.focused_debugger_pane = LiveDebuggerPane::Registers;
+            app.sync_legacy_focus_from_debugger_pane();
+        }
+        ConsoleCommand::Stack => {
+            app.set_active_right_tab(LiveRightTab::Stack);
+        }
+        ConsoleCommand::Maps => {
+            app.set_active_right_tab(LiveRightTab::Maps);
+        }
+        ConsoleCommand::HeapJump(query) => {
+            app.execute_heap_search_query(query);
+            if let Some(status) = app.search_status.clone() {
+                app.push_console_output(status);
+            }
+        }
+        ConsoleCommand::SelectRightTab(tab) => {
+            app.set_active_right_tab(tab);
+        }
+        ConsoleCommand::Unknown(input) => {
+            if !input.is_empty() {
+                app.push_console_output(format!("unknown command: {raw_input}; try help"));
+            }
+        }
+    }
     false
 }
 
@@ -2281,6 +2877,35 @@ fn send_live_command(
         return;
     }
 
+    apply_sent_live_command(app, command);
+}
+
+fn send_console_live_command(
+    app: &mut LiveTuiApp,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+    command: LiveCommand,
+) {
+    let message = match app.prepare_command(command) {
+        Ok(message) => message,
+        Err(reason) => {
+            app.push_console_output(reason);
+            return;
+        }
+    };
+
+    if control_sender.send(message).is_err() {
+        app.last_command = Some(command);
+        app.last_command_status = Some(LiveCommandStatus::Failed);
+        app.last_command_message = Some("failed to send command to trace worker".to_string());
+        app.status_line = "failed to send command to trace worker".to_string();
+        app.push_console_output("failed to send command to trace worker");
+        return;
+    }
+
+    apply_sent_live_command(app, command);
+}
+
+fn apply_sent_live_command(app: &mut LiveTuiApp, command: LiveCommand) {
     match command {
         LiveCommand::Stop => {
             app.target_status = LiveTargetStatus::Stopping;
@@ -2335,21 +2960,29 @@ fn live_tui_block(title: &str, focused: bool) -> Block<'static> {
     }
 }
 
-fn next_live_tui_pane(
-    current: LiveTuiPane,
-    visible: Vec<LiveTuiPane>,
-    direction: isize,
-) -> LiveTuiPane {
-    if visible.is_empty() {
-        return current;
-    }
-    let current_index = visible
-        .iter()
-        .position(|pane| *pane == current)
-        .unwrap_or(0) as isize;
-    let len = visible.len() as isize;
-    let next_index = (current_index + direction).rem_euclid(len) as usize;
-    visible[next_index]
+fn next_live_debugger_pane(current: LiveDebuggerPane, direction: isize) -> LiveDebuggerPane {
+    const PANES: [LiveDebuggerPane; 5] = [
+        LiveDebuggerPane::Registers,
+        LiveDebuggerPane::Code,
+        LiveDebuggerPane::Trace,
+        LiveDebuggerPane::Console,
+        LiveDebuggerPane::RightTab,
+    ];
+    let current_index = PANES.iter().position(|pane| *pane == current).unwrap_or(0) as isize;
+    let len = PANES.len() as isize;
+    PANES[(current_index + direction).rem_euclid(len) as usize]
+}
+
+fn next_live_right_tab(current: LiveRightTab, direction: isize) -> LiveRightTab {
+    const TABS: [LiveRightTab; 4] = [
+        LiveRightTab::Heap,
+        LiveRightTab::Stack,
+        LiveRightTab::Logs,
+        LiveRightTab::Maps,
+    ];
+    let current_index = TABS.iter().position(|tab| *tab == current).unwrap_or(0) as isize;
+    let len = TABS.len() as isize;
+    TABS[(current_index + direction).rem_euclid(len) as usize]
 }
 
 fn clamp_scroll(scroll: usize, line_count: usize, viewport_height: usize) -> usize {
@@ -2405,6 +3038,614 @@ fn live_event_details_text(app: &LiveTuiApp, config: &ReplayConfig) -> String {
         }
     }
     text
+}
+
+pub fn diff_register_snapshots(
+    previous: Option<&RegisterSnapshot>,
+    current: &RegisterSnapshot,
+) -> BTreeSet<String> {
+    let Some(previous) = previous else {
+        return BTreeSet::new();
+    };
+
+    let previous_values = previous
+        .registers
+        .iter()
+        .map(|register| (normalize_register_name(&register.name), register.value))
+        .collect::<BTreeMap<_, _>>();
+    current
+        .registers
+        .iter()
+        .filter_map(|register| {
+            let name = normalize_register_name(&register.name);
+            match previous_values.get(&name) {
+                Some(previous_value) if *previous_value == register.value => None,
+                _ => Some(name),
+            }
+        })
+        .collect()
+}
+
+pub fn render_register_lines(
+    snapshot: &RegisterSnapshot,
+    changed_registers: &BTreeSet<String>,
+    maps: Option<&ProcessMapsSnapshot>,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+    selected_chunk_user_addr: Option<u64>,
+) -> Vec<RenderedRegisterLine> {
+    const REGISTER_ORDER: [&str; 18] = [
+        "rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx", "rdi", "rsi", "r8", "r9", "r10", "r11",
+        "r12", "r13", "r14", "r15", "eflags",
+    ];
+
+    let registers = snapshot
+        .registers
+        .iter()
+        .map(|register| (normalize_register_name(&register.name), register))
+        .collect::<BTreeMap<_, _>>();
+    let mut rendered = Vec::new();
+    let mut emitted = BTreeSet::new();
+
+    for name in REGISTER_ORDER {
+        if let Some(register) = registers.get(name) {
+            emitted.insert(name.to_string());
+            rendered.push(render_register_line(
+                name,
+                register.value,
+                register.role,
+                changed_registers,
+                maps,
+                latest_heap_layout,
+                selected_chunk_user_addr,
+            ));
+        }
+    }
+
+    for (name, register) in registers {
+        if emitted.contains(&name) {
+            continue;
+        }
+        rendered.push(render_register_line(
+            &name,
+            register.value,
+            register.role,
+            changed_registers,
+            maps,
+            latest_heap_layout,
+            selected_chunk_user_addr,
+        ));
+    }
+
+    rendered
+}
+
+fn render_register_line(
+    name: &str,
+    value: u64,
+    role: Option<RegisterRole>,
+    changed_registers: &BTreeSet<String>,
+    maps: Option<&ProcessMapsSnapshot>,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+    selected_chunk_user_addr: Option<u64>,
+) -> RenderedRegisterLine {
+    let normalized_name = normalize_register_name(name);
+    RenderedRegisterLine {
+        name: normalized_name.to_uppercase(),
+        value: format_register_value_fixed_hex(value),
+        role,
+        changed: changed_registers.contains(&normalized_name),
+        annotation: annotate_register_value(
+            value,
+            maps,
+            latest_heap_layout,
+            selected_chunk_user_addr,
+        ),
+    }
+}
+
+fn normalize_register_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn format_register_value_fixed_hex(value: u64) -> String {
+    format!("0x{value:016x}")
+}
+
+pub fn classify_address(
+    address: u64,
+    maps: Option<&ProcessMapsSnapshot>,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+) -> AddressClassification {
+    if let Some(classification) = classify_heap_address(address, latest_heap_layout) {
+        return classification;
+    }
+
+    if let Some(entry) = maps.and_then(|snapshot| {
+        snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.start <= address && address < entry.end)
+    }) {
+        let (kind, label) = classify_map_entry(entry);
+        return AddressClassification {
+            address,
+            kind,
+            label,
+            map: Some(entry.clone()),
+            heap_detail: None,
+            symbol: None,
+        };
+    }
+
+    AddressClassification {
+        address,
+        kind: AddressRegionKind::Unknown,
+        label: "unmapped".to_string(),
+        map: None,
+        heap_detail: None,
+        symbol: None,
+    }
+}
+
+fn classify_heap_address(
+    address: u64,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+) -> Option<AddressClassification> {
+    let json::JsonTraceRecord::HeapLayout { chunks, .. } = latest_heap_layout? else {
+        return None;
+    };
+
+    for chunk in chunks {
+        let chunk_addr = parse_json_addr(&chunk.chunk_addr)?;
+        let user_addr = parse_json_addr(&chunk.user_addr)?;
+        if address == user_addr {
+            return Some(AddressClassification {
+                address,
+                kind: AddressRegionKind::Heap,
+                label: "heap user".to_string(),
+                map: None,
+                heap_detail: Some(HeapAddressDetail::UserPointer {
+                    chunk_addr,
+                    user_addr,
+                }),
+                symbol: None,
+            });
+        }
+        if address == chunk_addr {
+            return Some(AddressClassification {
+                address,
+                kind: AddressRegionKind::Heap,
+                label: "heap chunk".to_string(),
+                map: None,
+                heap_detail: Some(HeapAddressDetail::ChunkHeader {
+                    chunk_addr,
+                    user_addr,
+                }),
+                symbol: None,
+            });
+        }
+    }
+
+    for chunk in chunks {
+        let Some(chunk_addr) = parse_json_addr(&chunk.chunk_addr) else {
+            continue;
+        };
+        let Some(user_addr) = parse_json_addr(&chunk.user_addr) else {
+            continue;
+        };
+        let Some(size) = parse_json_addr(&chunk.size) else {
+            continue;
+        };
+        let Some(end) = chunk_addr.checked_add(size) else {
+            continue;
+        };
+        if chunk_addr <= address && address < end {
+            let offset = address.saturating_sub(user_addr);
+            return Some(AddressClassification {
+                address,
+                kind: AddressRegionKind::Heap,
+                label: format!("heap+0x{offset:x}"),
+                map: None,
+                heap_detail: Some(HeapAddressDetail::Interior {
+                    chunk_addr,
+                    user_addr,
+                    offset,
+                }),
+                symbol: None,
+            });
+        }
+    }
+
+    None
+}
+
+fn classify_map_entry(entry: &ProcessMapEntry) -> (AddressRegionKind, String) {
+    let pathname = entry.pathname.as_deref().unwrap_or_default();
+    match pathname {
+        "[heap]" => return (AddressRegionKind::Heap, "heap".to_string()),
+        "[stack]" => return (AddressRegionKind::Stack, "stack".to_string()),
+        "[vdso]" => return (AddressRegionKind::Vdso, "vdso".to_string()),
+        "[vvar]" => return (AddressRegionKind::Vvar, "vvar".to_string()),
+        "[vsyscall]" => return (AddressRegionKind::Vsvar, "vsyscall".to_string()),
+        _ => {}
+    }
+
+    if pathname.contains("libc.so")
+        || pathname.ends_with("/libc.so.6")
+        || pathname.contains("libc-")
+    {
+        return (AddressRegionKind::Libc, "libc".to_string());
+    }
+    if pathname.contains("ld-linux") || pathname.contains("/ld-") {
+        return (AddressRegionKind::Loader, "loader".to_string());
+    }
+    if pathname.is_empty() {
+        return (AddressRegionKind::Anonymous, "anon".to_string());
+    }
+    if entry.permissions.contains('x') {
+        return (AddressRegionKind::Code, "code".to_string());
+    }
+
+    (
+        AddressRegionKind::MappedFile,
+        map_path_label(pathname).to_string(),
+    )
+}
+
+fn map_path_label(pathname: &str) -> &str {
+    pathname
+        .rsplit('/')
+        .next()
+        .filter(|basename| !basename.is_empty())
+        .unwrap_or(pathname)
+}
+
+fn annotation_from_classification(classification: AddressClassification) -> Option<String> {
+    match classification.kind {
+        AddressRegionKind::Unknown => None,
+        AddressRegionKind::Heap => match classification.heap_detail {
+            Some(HeapAddressDetail::Interior { .. }) => Some("heap".to_string()),
+            Some(HeapAddressDetail::ChunkHeader { .. }) => Some("heap chunk".to_string()),
+            _ => Some(classification.label),
+        },
+        _ => Some(classification.label),
+    }
+}
+
+fn annotate_register_value(
+    value: u64,
+    maps: Option<&ProcessMapsSnapshot>,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+    selected_chunk_user_addr: Option<u64>,
+) -> Option<String> {
+    if selected_chunk_user_addr == Some(value) {
+        return Some("selected chunk".to_string());
+    }
+
+    annotation_from_classification(classify_address(value, maps, latest_heap_layout))
+}
+
+fn annotate_stack_snapshot(
+    mut snapshot: StackSnapshot,
+    maps: Option<&ProcessMapsSnapshot>,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+    current_rip: Option<u64>,
+) -> StackSnapshot {
+    for word in &mut snapshot.words {
+        word.annotation = annotate_stack_value(word.value, maps, latest_heap_layout, current_rip);
+    }
+    snapshot
+}
+
+fn annotate_stack_value(
+    value: u64,
+    maps: Option<&ProcessMapsSnapshot>,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+    current_rip: Option<u64>,
+) -> Option<String> {
+    if current_rip == Some(value) {
+        return Some("rip".to_string());
+    }
+
+    annotation_from_classification(classify_address(value, maps, latest_heap_layout))
+}
+
+pub fn format_stack_word_line(word: &StackWord) -> String {
+    let annotation = word
+        .annotation
+        .as_deref()
+        .map(|annotation| format!(" ; {annotation}"))
+        .unwrap_or_default();
+    format!(
+        "{}  {}  {}{}",
+        format_stack_offset(word.offset_from_sp),
+        format_register_value_fixed_hex(word.address),
+        format_register_value_fixed_hex(word.value),
+        annotation
+    )
+}
+
+fn format_stack_offset(offset: i64) -> String {
+    if offset < 0 {
+        format!("-0x{:03x}", offset.unsigned_abs())
+    } else {
+        format!("+0x{offset:03x}")
+    }
+}
+
+pub fn format_stack_snapshot_lines(snapshot: &StackSnapshot) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "RSP:       {}",
+            format_register_value_fixed_hex(snapshot.stack_pointer)
+        ),
+        format!("Word size: {} bytes", snapshot.word_size),
+    ];
+
+    if snapshot.truncated {
+        let warning = snapshot
+            .read_error
+            .as_deref()
+            .map(|error| format!("truncated: {error}"))
+            .unwrap_or_else(|| "truncated".to_string());
+        lines.push(warning);
+    }
+
+    lines.push(String::new());
+    lines.push("Offset  Address             Value".to_string());
+    lines.extend(snapshot.words.iter().map(format_stack_word_line));
+    lines
+}
+
+fn format_live_stack_tab(app: &LiveTuiApp) -> String {
+    app.latest_stack_snapshot
+        .as_ref()
+        .map(format_stack_snapshot_lines)
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_else(|| "stack snapshot unavailable".to_string())
+}
+
+pub fn format_process_map_entry(entry: &ProcessMapEntry) -> String {
+    let pathname = entry.pathname.as_deref().unwrap_or("");
+    let device = entry.device.as_deref().unwrap_or("??:??");
+    let inode = entry
+        .inode
+        .map(|inode| inode.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    if pathname.is_empty() {
+        format!(
+            "{:016x}-{:016x} {:<4} {:08x} {:>5} {:>8}",
+            entry.start, entry.end, entry.permissions, entry.offset, device, inode
+        )
+    } else {
+        format!(
+            "{:016x}-{:016x} {:<4} {:08x} {:>5} {:>8} {}",
+            entry.start, entry.end, entry.permissions, entry.offset, device, inode, pathname
+        )
+    }
+}
+
+pub fn format_process_maps_lines(snapshot: &ProcessMapsSnapshot) -> Vec<String> {
+    let mut lines =
+        vec!["Start-End                         Perm Offset   Dev    Inode Path".to_string()];
+    lines.extend(snapshot.entries.iter().map(format_process_map_entry));
+    lines
+}
+
+fn format_live_maps_tab(app: &LiveTuiApp) -> String {
+    app.latest_process_maps
+        .as_ref()
+        .map(format_process_maps_lines)
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_else(|| "process maps unavailable".to_string())
+}
+
+fn format_live_registers_pane(app: &LiveTuiApp) -> String {
+    let Some(snapshot) = app.latest_register_snapshot.as_ref() else {
+        return "registers unavailable".to_string();
+    };
+
+    render_register_lines(
+        snapshot,
+        &app.changed_registers,
+        app.latest_process_maps.as_ref(),
+        app.latest_heap_layout.as_ref(),
+        app.selected_chunk_user_addr,
+    )
+    .into_iter()
+    .map(|line| format_rendered_register_line(&line))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn format_rendered_register_line(line: &RenderedRegisterLine) -> String {
+    let marker = if line.changed { "*" } else { " " };
+    let annotation = line
+        .annotation
+        .as_deref()
+        .map(|annotation| format!(" ; {annotation}"))
+        .unwrap_or_default();
+    format!("{marker} {:<7} {}{}", line.name, line.value, annotation)
+}
+
+pub fn build_minimal_code_context(rip: u64) -> CodeContext {
+    CodeContext {
+        instruction_pointer: rip,
+        symbol: None,
+        symbol_addr: None,
+        symbol_offset: None,
+        object: None,
+        source: None,
+        disassembly: vec![DisassemblyLine {
+            address: rip,
+            text: "<disassembly unavailable>".to_string(),
+            is_current: true,
+        }],
+    }
+}
+
+fn build_code_context(
+    rip: u64,
+    symbolizer: Option<&ProcessSymbolizer>,
+    source_mapper: Option<&TargetSourceMapper>,
+) -> CodeContext {
+    let mut context = build_minimal_code_context(rip);
+
+    if let Some(symbolized) = symbolizer.and_then(|symbolizer| symbolizer.symbolize(rip)) {
+        context.symbol = Some(symbolized.symbol);
+        context.symbol_addr = Some(symbolized.symbol_addr);
+        context.symbol_offset = Some(symbolized.offset);
+        context.object = symbolized.object_name;
+        context.source = symbolized.source;
+    }
+
+    if context.source.is_none() {
+        context.source = source_mapper.and_then(|source_mapper| source_mapper.lookup(rip));
+    }
+
+    context
+}
+
+pub fn format_code_symbol(
+    symbol: Option<&str>,
+    offset: Option<u64>,
+    object: Option<&str>,
+) -> String {
+    let Some(symbol) = symbol else {
+        return "unavailable".to_string();
+    };
+
+    let mut formatted = symbol.to_string();
+    if let Some(offset) = offset {
+        if offset > 0 {
+            formatted.push_str(&format!("+0x{offset:x}"));
+        }
+    }
+    if let Some(object) = object {
+        formatted.push_str(&format!(" ({object})"));
+    }
+    formatted
+}
+
+pub fn format_source_location(source: Option<&SourceLocation>) -> String {
+    let Some(source) = source else {
+        return "unavailable".to_string();
+    };
+
+    let mut formatted = source.file.clone().unwrap_or_else(|| "?".to_string());
+    if let Some(line) = source.line {
+        formatted.push_str(&format!(":{line}"));
+        if let Some(column) = source.column {
+            formatted.push_str(&format!(":{column}"));
+        }
+    }
+    formatted
+}
+
+pub fn format_code_context_lines(context: &CodeContext) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "RIP:     {}",
+            format_register_value_fixed_hex(context.instruction_pointer)
+        ),
+        format!(
+            "Symbol:  {}",
+            format_code_symbol(
+                context.symbol.as_deref(),
+                context.symbol_offset,
+                context.object.as_deref()
+            )
+        ),
+        format!(
+            "Source:  {}",
+            format_source_location(context.source.as_ref())
+        ),
+        format!(
+            "Object:  {}",
+            context.object.as_deref().unwrap_or("unavailable")
+        ),
+        String::new(),
+        "Disassembly:".to_string(),
+    ];
+
+    if context.disassembly.is_empty() {
+        lines.push(format!(
+            "> {}  <disassembly unavailable>",
+            format_register_value_fixed_hex(context.instruction_pointer)
+        ));
+    } else {
+        lines.extend(context.disassembly.iter().map(|line| {
+            let marker = if line.is_current { ">" } else { " " };
+            format!(
+                "{marker} {}  {}",
+                format_register_value_fixed_hex(line.address),
+                line.text
+            )
+        }));
+    }
+
+    lines
+}
+
+fn format_live_code_context(app: &LiveTuiApp) -> String {
+    app.latest_code_context
+        .as_ref()
+        .map(format_code_context_lines)
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_else(|| "code context unavailable".to_string())
+}
+
+fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String {
+    let mut lines = Vec::new();
+    let log_lines = viewport_height.saturating_sub(6);
+    if log_lines > 0 {
+        lines.extend(
+            app.logs
+                .iter()
+                .rev()
+                .take(log_lines)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .cloned(),
+        );
+    }
+    lines.push(format!("target: {}", app.target_status.as_str()));
+    lines.push(format!(
+        "follow: {}",
+        if app.follow_tail { "on" } else { "off" }
+    ));
+    if let Some(status) = app.last_command_status {
+        let command = app
+            .last_command
+            .map(LiveCommand::as_str)
+            .unwrap_or("target");
+        lines.push(format!("{command}: {}", status.as_str()));
+    }
+    if let Some(message) = app
+        .search_status
+        .as_deref()
+        .or(app.last_command_message.as_deref())
+        .or(Some(app.status_line.as_str()))
+    {
+        lines.push(message.to_string());
+    }
+    lines.push("keys: Tab focus | 1 heap 2 stack 3 logs 4 maps | Space pause/resume | n next event | g jump".to_string());
+    if app.search_prompt_active {
+        lines.push(format!("jump> {}", app.search_prompt_input));
+    } else if app.console_input_active {
+        lines.push(format!("heapify> {}", app.console_input));
+    } else {
+        lines.push("heapify> press ':' for command".to_string());
+    }
+    lines.join("\n")
+}
+
+fn format_live_logs_pane(app: &LiveTuiApp) -> String {
+    if app.logs.is_empty() {
+        return "no logs yet".to_string();
+    }
+    app.logs.iter().cloned().collect::<Vec<_>>().join("\n")
 }
 
 fn live_related_records_text(app: &LiveTuiApp, config: &ReplayConfig) -> String {
@@ -2537,6 +3778,50 @@ pub fn parse_heap_search_query(input: &str) -> Result<HeapSearchQuery> {
             })
         }
         _ => bail!("too many tokens in heap jump query"),
+    }
+}
+
+pub fn parse_console_command(input: &str) -> ConsoleCommand {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return ConsoleCommand::Unknown(String::new());
+    }
+
+    let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    match tokens.as_slice() {
+        ["help" | "h" | "?"] => ConsoleCommand::Help,
+        ["continue" | "c" | "run"] => ConsoleCommand::Continue,
+        ["pause" | "p"] => ConsoleCommand::Pause,
+        ["resume" | "r"] => ConsoleCommand::Resume,
+        ["next" | "n" | "next-alloc" | "next_allocator_event"] => {
+            ConsoleCommand::NextAllocatorEvent
+        }
+        ["stop" | "quit" | "q"] => ConsoleCommand::Stop,
+        ["regs" | "registers"] => ConsoleCommand::Registers,
+        ["stack"] => ConsoleCommand::Stack,
+        ["maps"] => ConsoleCommand::Maps,
+        ["heap", rest @ ..] | ["jump", rest @ ..] => {
+            if rest.is_empty() {
+                return ConsoleCommand::Unknown(trimmed.to_string());
+            }
+            parse_heap_search_query(&rest.join(" "))
+                .map(ConsoleCommand::HeapJump)
+                .unwrap_or_else(|_| ConsoleCommand::Unknown(trimmed.to_string()))
+        }
+        ["tab", tab] => parse_console_tab(tab)
+            .map(ConsoleCommand::SelectRightTab)
+            .unwrap_or_else(|| ConsoleCommand::Unknown(trimmed.to_string())),
+        _ => ConsoleCommand::Unknown(trimmed.to_string()),
+    }
+}
+
+fn parse_console_tab(tab: &str) -> Option<LiveRightTab> {
+    match tab {
+        "heap" => Some(LiveRightTab::Heap),
+        "stack" => Some(LiveRightTab::Stack),
+        "logs" => Some(LiveRightTab::Logs),
+        "maps" => Some(LiveRightTab::Maps),
+        _ => None,
     }
 }
 
@@ -7383,12 +8668,12 @@ fn format_symbolized_caller(caller_symbol: &SymbolizedAddress) -> String {
 }
 
 fn maybe_print_source_location(source: Option<&SourceLocation>) {
-    if let Some(source) = source.and_then(format_source_location) {
+    if let Some(source) = source.and_then(format_printable_source_location) {
         println!("    at          {source}");
     }
 }
 
-fn format_source_location(source: &SourceLocation) -> Option<String> {
+fn format_printable_source_location(source: &SourceLocation) -> Option<String> {
     format_source_location_parts(source.file.as_deref(), source.line, source.column)
 }
 
@@ -9798,9 +11083,11 @@ mod tests {
     };
     use heapify_core::tcache::ObservedTcacheChain;
     use heapify_debugger::{
-        AllocationTraceMode, RegisterArch, RegisterRole, RegisterSnapshot, RegisterValue,
-        StdinConfig, SymbolizedAddress,
+        AllocationTraceMode, ProcessMapEntry, ProcessMapsSnapshot, RegisterArch, RegisterRole,
+        RegisterSnapshot, RegisterValue, SourceLocation, StackSnapshot, StackWord, StdinConfig,
+        SymbolizedAddress,
     };
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     #[test]
@@ -12091,6 +13378,123 @@ mod tests {
         }
     }
 
+    fn test_register_value(name: &str, value: u64, role: RegisterRole) -> RegisterValue {
+        RegisterValue {
+            name: name.to_string(),
+            value,
+            role: Some(role),
+        }
+    }
+
+    fn test_code_context(rip: u64) -> super::CodeContext {
+        super::CodeContext {
+            instruction_pointer: rip,
+            symbol: Some("main".to_string()),
+            symbol_addr: Some(0x401000),
+            symbol_offset: Some(rip.saturating_sub(0x401000)),
+            object: Some("target".to_string()),
+            source: Some(SourceLocation {
+                file: Some("src/main.c".to_string()),
+                line: Some(42),
+                column: Some(7),
+            }),
+            disassembly: vec![super::DisassemblyLine {
+                address: rip,
+                text: "<disassembly unavailable>".to_string(),
+                is_current: true,
+            }],
+        }
+    }
+
+    fn test_stack_snapshot(values: &[u64]) -> StackSnapshot {
+        StackSnapshot {
+            stack_pointer: 0x7fffffffdc30,
+            word_size: 8,
+            words: values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| StackWord {
+                    offset_from_sp: (index as i64) * 8,
+                    address: 0x7fffffffdc30 + (index as u64) * 8,
+                    value: *value,
+                    annotation: None,
+                })
+                .collect(),
+            truncated: false,
+            read_error: None,
+        }
+    }
+
+    fn test_process_maps() -> ProcessMapsSnapshot {
+        ProcessMapsSnapshot {
+            entries: vec![
+                ProcessMapEntry {
+                    start: 0x555555554000,
+                    end: 0x555555556000,
+                    permissions: "r-xp".to_string(),
+                    offset: 0,
+                    device: Some("08:20".to_string()),
+                    inode: Some(11),
+                    pathname: Some("/tmp/heapify-target".to_string()),
+                },
+                ProcessMapEntry {
+                    start: 0x555555559000,
+                    end: 0x55555557a000,
+                    permissions: "rw-p".to_string(),
+                    offset: 0,
+                    device: Some("00:00".to_string()),
+                    inode: Some(0),
+                    pathname: Some("[heap]".to_string()),
+                },
+                ProcessMapEntry {
+                    start: 0x7ffff7dd5000,
+                    end: 0x7ffff7f9d000,
+                    permissions: "r-xp".to_string(),
+                    offset: 0x26000,
+                    device: Some("08:20".to_string()),
+                    inode: Some(12),
+                    pathname: Some("/usr/lib/x86_64-linux-gnu/libc.so.6".to_string()),
+                },
+                ProcessMapEntry {
+                    start: 0x7ffff7fc0000,
+                    end: 0x7ffff7ffb000,
+                    permissions: "r-xp".to_string(),
+                    offset: 0,
+                    device: Some("08:20".to_string()),
+                    inode: Some(13),
+                    pathname: Some("/usr/lib64/ld-linux-x86-64.so.2".to_string()),
+                },
+                ProcessMapEntry {
+                    start: 0x7ffffffde000,
+                    end: 0x7ffffffff000,
+                    permissions: "rw-p".to_string(),
+                    offset: 0,
+                    device: Some("00:00".to_string()),
+                    inode: Some(0),
+                    pathname: Some("[stack]".to_string()),
+                },
+                ProcessMapEntry {
+                    start: 0x7ffff7ffe000,
+                    end: 0x7ffff7fff000,
+                    permissions: "r-xp".to_string(),
+                    offset: 0,
+                    device: Some("00:00".to_string()),
+                    inode: Some(0),
+                    pathname: Some("[vdso]".to_string()),
+                },
+                ProcessMapEntry {
+                    start: 0x7ffff7ffc000,
+                    end: 0x7ffff7ffd000,
+                    permissions: "r--p".to_string(),
+                    offset: 0,
+                    device: Some("00:00".to_string()),
+                    inode: Some(0),
+                    pathname: Some("[vvar]".to_string()),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn live_tui_app_session_start_stores_metadata() {
         let mut app = super::LiveTuiApp::default();
@@ -12129,6 +13533,8 @@ mod tests {
 
         assert_eq!(app.latest_register_snapshot, Some(snapshot));
         assert!(app.register_snapshots_by_event_id.is_empty());
+        assert!(app.previous_register_snapshot.is_none());
+        assert!(app.changed_registers.is_empty());
     }
 
     #[test]
@@ -12146,41 +13552,713 @@ mod tests {
     }
 
     #[test]
-    fn live_tui_focus_next_cycles_visible_panes() {
-        let mut app = super::LiveTuiApp::default();
+    fn build_minimal_code_context_sets_rip() {
+        let context = super::build_minimal_code_context(0x4011a5);
 
-        app.focus_next_pane();
-        assert_eq!(app.focused_pane, super::LiveTuiPane::EventDetails);
-        app.focus_next_pane();
-        assert_eq!(app.focused_pane, super::LiveTuiPane::RelatedRecords);
-        app.focus_next_pane();
-        assert_eq!(app.focused_pane, super::LiveTuiPane::HeapLayout);
-        app.focus_next_pane();
-        assert_eq!(app.focused_pane, super::LiveTuiPane::AllocatorScan);
-        app.focus_next_pane();
-        assert_eq!(app.focused_pane, super::LiveTuiPane::Events);
+        assert_eq!(context.instruction_pointer, 0x4011a5);
+        assert_eq!(context.symbol, None);
+        assert_eq!(context.object, None);
     }
 
     #[test]
-    fn live_tui_focus_skips_hidden_heap_pane() {
-        let mut app = super::LiveTuiApp::default();
-        app.show_heap_pane = false;
-        app.focused_pane = super::LiveTuiPane::RelatedRecords;
+    fn format_code_context_lines_renders_rip() {
+        let context = test_code_context(0x4011a5);
 
-        app.focus_next_pane();
+        let rendered = super::format_code_context_lines(&context).join("\n");
 
-        assert_eq!(app.focused_pane, super::LiveTuiPane::AllocatorScan);
+        assert!(rendered.contains("RIP:     0x00000000004011a5"));
     }
 
     #[test]
-    fn live_tui_focus_skips_hidden_scan_pane() {
+    fn format_code_context_lines_renders_unavailable_fields() {
+        let context = super::build_minimal_code_context(0x4011a5);
+
+        let rendered = super::format_code_context_lines(&context).join("\n");
+
+        assert!(rendered.contains("Symbol:  unavailable"));
+        assert!(rendered.contains("Source:  unavailable"));
+        assert!(rendered.contains("Object:  unavailable"));
+    }
+
+    #[test]
+    fn format_code_context_lines_renders_disassembly_placeholder() {
+        let context = super::build_minimal_code_context(0x4011a5);
+
+        let rendered = super::format_code_context_lines(&context).join("\n");
+
+        assert!(rendered.contains("Disassembly:"));
+        assert!(rendered.contains("> 0x00000000004011a5  <disassembly unavailable>"));
+    }
+
+    #[test]
+    fn live_tui_app_stores_latest_code_context() {
         let mut app = super::LiveTuiApp::default();
-        app.show_scan_pane = false;
-        app.focused_pane = super::LiveTuiPane::HeapLayout;
+        let context = test_code_context(0x4011a5);
+
+        app.apply_update(super::LiveTraceUpdate::CodeContext {
+            event_id: None,
+            context: context.clone(),
+        });
+
+        assert_eq!(app.latest_code_context, Some(context));
+        assert!(app.code_context_by_event_id.is_empty());
+    }
+
+    #[test]
+    fn live_tui_app_stores_event_specific_code_context() {
+        let mut app = super::LiveTuiApp::default();
+        let context = test_code_context(0x4011a5);
+
+        app.apply_update(super::LiveTraceUpdate::CodeContext {
+            event_id: Some(7),
+            context: context.clone(),
+        });
+
+        assert_eq!(app.latest_code_context, Some(context.clone()));
+        assert_eq!(app.code_context_by_event_id.get(&7), Some(&context));
+    }
+
+    #[test]
+    fn format_stack_snapshot_lines_renders_rsp() {
+        let snapshot = test_stack_snapshot(&[0x4011a5]);
+
+        let rendered = super::format_stack_snapshot_lines(&snapshot).join("\n");
+
+        assert!(rendered.contains("RSP:       0x00007fffffffdc30"));
+    }
+
+    #[test]
+    fn format_stack_snapshot_lines_renders_stack_rows() {
+        let snapshot = test_stack_snapshot(&[0x4011a5, 0xd972a0]);
+
+        let rendered = super::format_stack_snapshot_lines(&snapshot).join("\n");
+
+        assert!(rendered.contains("+0x000  0x00007fffffffdc30  0x00000000004011a5"));
+        assert!(rendered.contains("+0x008  0x00007fffffffdc38  0x0000000000d972a0"));
+    }
+
+    #[test]
+    fn format_stack_snapshot_lines_renders_truncated_warning() {
+        let mut snapshot = test_stack_snapshot(&[0x4011a5]);
+        snapshot.truncated = true;
+        snapshot.read_error = Some("failed to read word".to_string());
+
+        let rendered = super::format_stack_snapshot_lines(&snapshot).join("\n");
+
+        assert!(rendered.contains("truncated: failed to read word"));
+    }
+
+    #[test]
+    fn stack_annotation_marks_heap_user_pointer() {
+        let layout = layout_record_with_chunks(1, &[(0x1000, 0x1010)]);
+
+        let annotation = super::annotate_stack_value(0x1010, None, Some(&layout), None);
+
+        assert_eq!(annotation.as_deref(), Some("heap user"));
+    }
+
+    #[test]
+    fn stack_annotation_marks_interior_heap_pointer() {
+        let layout = layout_record_with_chunks(1, &[(0x1000, 0x1010)]);
+
+        let annotation = super::annotate_stack_value(0x1020, None, Some(&layout), None);
+
+        assert_eq!(annotation.as_deref(), Some("heap"));
+    }
+
+    #[test]
+    fn stack_annotation_marks_current_rip() {
+        let annotation = super::annotate_stack_value(0x4011a5, None, None, Some(0x4011a5));
+
+        assert_eq!(annotation.as_deref(), Some("rip"));
+    }
+
+    #[test]
+    fn stack_annotation_uses_classifier_for_code_and_stack_maps() {
+        let maps = test_process_maps();
+
+        let code = super::annotate_stack_value(0x555555555000, Some(&maps), None, None);
+        let stack = super::annotate_stack_value(0x7fffffffe000, Some(&maps), None, None);
+
+        assert_eq!(code.as_deref(), Some("code"));
+        assert_eq!(stack.as_deref(), Some("stack"));
+    }
+
+    #[test]
+    fn live_tui_app_stores_latest_stack_snapshot() {
+        let mut app = super::LiveTuiApp::default();
+        let snapshot = test_stack_snapshot(&[0x4011a5]);
+
+        app.apply_update(super::LiveTraceUpdate::StackSnapshot {
+            event_id: None,
+            snapshot: snapshot.clone(),
+        });
+
+        assert_eq!(app.latest_stack_snapshot, Some(snapshot));
+        assert!(app.stack_snapshots_by_event_id.is_empty());
+    }
+
+    #[test]
+    fn live_tui_app_stores_event_specific_stack_snapshot() {
+        let mut app = super::LiveTuiApp::default();
+        let snapshot = test_stack_snapshot(&[0x4011a5]);
+
+        app.apply_update(super::LiveTraceUpdate::StackSnapshot {
+            event_id: Some(7),
+            snapshot: snapshot.clone(),
+        });
+
+        assert_eq!(app.latest_stack_snapshot, Some(snapshot.clone()));
+        assert_eq!(app.stack_snapshots_by_event_id.get(&7), Some(&snapshot));
+    }
+
+    #[test]
+    fn classify_address_finds_heap_user_pointer() {
+        let layout = layout_record_with_chunks(1, &[(0x1000, 0x1010)]);
+
+        let classification = super::classify_address(0x1010, None, Some(&layout));
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Heap);
+        assert_eq!(classification.label, "heap user");
+        assert!(matches!(
+            classification.heap_detail,
+            Some(super::HeapAddressDetail::UserPointer { .. })
+        ));
+    }
+
+    #[test]
+    fn classify_address_finds_heap_chunk_header() {
+        let layout = layout_record_with_chunks(1, &[(0x1000, 0x1010)]);
+
+        let classification = super::classify_address(0x1000, None, Some(&layout));
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Heap);
+        assert_eq!(classification.label, "heap chunk");
+        assert!(matches!(
+            classification.heap_detail,
+            Some(super::HeapAddressDetail::ChunkHeader { .. })
+        ));
+    }
+
+    #[test]
+    fn classify_address_finds_heap_interior_pointer() {
+        let layout = layout_record_with_chunks(1, &[(0x1000, 0x1010)]);
+
+        let classification = super::classify_address(0x1020, None, Some(&layout));
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Heap);
+        assert_eq!(classification.label, "heap+0x10");
+        assert!(matches!(
+            classification.heap_detail,
+            Some(super::HeapAddressDetail::Interior { offset: 0x10, .. })
+        ));
+    }
+
+    #[test]
+    fn classify_address_finds_heap_map() {
+        let maps = test_process_maps();
+
+        let classification = super::classify_address(0x55555555a000, Some(&maps), None);
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Heap);
+        assert_eq!(classification.label, "heap");
+    }
+
+    #[test]
+    fn classify_address_finds_stack_map() {
+        let maps = test_process_maps();
+
+        let classification = super::classify_address(0x7fffffffe000, Some(&maps), None);
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Stack);
+        assert_eq!(classification.label, "stack");
+    }
+
+    #[test]
+    fn classify_address_classifies_libc_pathname() {
+        let maps = test_process_maps();
+
+        let classification = super::classify_address(0x7ffff7de0000, Some(&maps), None);
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Libc);
+        assert_eq!(classification.label, "libc");
+    }
+
+    #[test]
+    fn classify_address_classifies_ld_linux_pathname() {
+        let maps = test_process_maps();
+
+        let classification = super::classify_address(0x7ffff7fc1000, Some(&maps), None);
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Loader);
+        assert_eq!(classification.label, "loader");
+    }
+
+    #[test]
+    fn classify_address_classifies_vdso_and_vvar() {
+        let maps = test_process_maps();
+
+        let vdso = super::classify_address(0x7ffff7ffe010, Some(&maps), None);
+        let vvar = super::classify_address(0x7ffff7ffc010, Some(&maps), None);
+
+        assert_eq!(vdso.kind, super::AddressRegionKind::Vdso);
+        assert_eq!(vdso.label, "vdso");
+        assert_eq!(vvar.kind, super::AddressRegionKind::Vvar);
+        assert_eq!(vvar.label, "vvar");
+    }
+
+    #[test]
+    fn classify_address_returns_unknown_for_unmapped_address() {
+        let maps = test_process_maps();
+
+        let classification = super::classify_address(0xdeadbeef, Some(&maps), None);
+
+        assert_eq!(classification.kind, super::AddressRegionKind::Unknown);
+        assert_eq!(classification.label, "unmapped");
+    }
+
+    #[test]
+    fn format_process_map_entry_renders_range_permissions_and_path() {
+        let entry = &test_process_maps().entries[0];
+
+        let rendered = super::format_process_map_entry(entry);
+
+        assert!(rendered.contains("0000555555554000-0000555555556000"));
+        assert!(rendered.contains("r-xp"));
+        assert!(rendered.contains("/tmp/heapify-target"));
+    }
+
+    #[test]
+    fn live_tui_app_stores_latest_process_maps() {
+        let mut app = super::LiveTuiApp::default();
+        let snapshot = test_process_maps();
+
+        app.apply_update(super::LiveTraceUpdate::ProcessMaps {
+            snapshot: snapshot.clone(),
+        });
+
+        assert_eq!(app.latest_process_maps, Some(snapshot));
+    }
+
+    #[test]
+    fn maps_tab_renders_unavailable_without_maps() {
+        let app = super::LiveTuiApp::default();
+
+        assert_eq!(
+            super::format_live_maps_tab(&app),
+            "process maps unavailable"
+        );
+    }
+
+    #[test]
+    fn maps_tab_renders_formatted_map_lines() {
+        let mut app = super::LiveTuiApp::default();
+        app.latest_process_maps = Some(test_process_maps());
+
+        let rendered = super::format_live_maps_tab(&app);
+
+        assert!(rendered.contains("Start-End"));
+        assert!(rendered.contains("[stack]"));
+        assert!(rendered.contains("libc.so.6"));
+    }
+
+    #[test]
+    fn live_tui_scrolls_maps_tab() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.focused_debugger_pane = super::LiveDebuggerPane::RightTab;
+        app.active_right_tab = super::LiveRightTab::Maps;
+        app.latest_process_maps = Some(ProcessMapsSnapshot {
+            entries: (0..20)
+                .map(|index| ProcessMapEntry {
+                    start: 0x1000 + index * 0x1000,
+                    end: 0x2000 + index * 0x1000,
+                    permissions: "r--p".to_string(),
+                    offset: 0,
+                    device: Some("00:00".to_string()),
+                    inode: Some(index),
+                    pathname: Some(format!("/tmp/map-{index}")),
+                })
+                .collect(),
+        });
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert_eq!(app.maps_tab_scroll, 10);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_stack_tab_renders_unavailable_without_snapshot() {
+        let app = super::LiveTuiApp::default();
+
+        assert_eq!(
+            super::format_live_stack_tab(&app),
+            "stack snapshot unavailable"
+        );
+    }
+
+    #[test]
+    fn live_stack_tab_renders_rows_with_snapshot() {
+        let mut app = super::LiveTuiApp::default();
+        app.latest_stack_snapshot = Some(test_stack_snapshot(&[0x4011a5]));
+
+        let rendered = super::format_live_stack_tab(&app);
+
+        assert!(rendered.contains("RSP:       0x00007fffffffdc30"));
+        assert!(rendered.contains("+0x000  0x00007fffffffdc30  0x00000000004011a5"));
+    }
+
+    #[test]
+    fn live_tui_scrolls_stack_tab() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.focused_debugger_pane = super::LiveDebuggerPane::RightTab;
+        app.active_right_tab = super::LiveRightTab::Stack;
+        app.latest_stack_snapshot = Some(test_stack_snapshot(&(0..20).collect::<Vec<_>>()));
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert_eq!(app.stack_tab_scroll, 10);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_code_pane_renders_unavailable_without_context() {
+        let app = super::LiveTuiApp::default();
+
+        assert_eq!(
+            super::format_live_code_context(&app),
+            "code context unavailable"
+        );
+    }
+
+    #[test]
+    fn live_code_pane_renders_context_with_rip_symbol_source() {
+        let mut app = super::LiveTuiApp::default();
+        app.latest_code_context = Some(test_code_context(0x4011a5));
+
+        let rendered = super::format_live_code_context(&app);
+
+        assert!(rendered.contains("RIP:     0x00000000004011a5"));
+        assert!(rendered.contains("Symbol:  main+0x1a5 (target)"));
+        assert!(rendered.contains("Source:  src/main.c:42:7"));
+    }
+
+    #[test]
+    fn live_tui_scrolls_code_pane() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.focused_debugger_pane = super::LiveDebuggerPane::Code;
+        app.latest_code_context = Some(super::CodeContext {
+            disassembly: (0..20)
+                .map(|index| super::DisassemblyLine {
+                    address: 0x401000 + index,
+                    text: format!("line {index}"),
+                    is_current: index == 0,
+                })
+                .collect(),
+            ..test_code_context(0x401000)
+        });
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert_eq!(app.code_pane_scroll, 10);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn diff_register_snapshots_without_previous_returns_empty() {
+        let current = test_register_snapshot(0xd972a0);
+
+        assert!(super::diff_register_snapshots(None, &current).is_empty());
+    }
+
+    #[test]
+    fn diff_register_snapshots_detects_changed_rax() {
+        let previous = test_register_snapshot(0x1);
+        let current = test_register_snapshot(0x2);
+
+        let changed = super::diff_register_snapshots(Some(&previous), &current);
+
+        assert!(changed.contains("rax"));
+        assert!(!changed.contains("rip"));
+    }
+
+    #[test]
+    fn diff_register_snapshots_detects_new_register() {
+        let previous = test_register_snapshot(0x1);
+        let mut current = test_register_snapshot(0x1);
+        current
+            .registers
+            .push(test_register_value("R10", 0x10, RegisterRole::General));
+
+        let changed = super::diff_register_snapshots(Some(&previous), &current);
+
+        assert!(changed.contains("r10"));
+    }
+
+    #[test]
+    fn register_rendering_uses_stable_order() {
+        let snapshot = RegisterSnapshot {
+            arch: RegisterArch::X86_64,
+            instruction_pointer: 0x4011a5,
+            stack_pointer: 0x7fffffffdc30,
+            frame_pointer: 0x7fffffffdc80,
+            registers: vec![
+                test_register_value("rax", 0x1, RegisterRole::ReturnValue),
+                test_register_value("rip", 0x2, RegisterRole::InstructionPointer),
+                test_register_value("r9", 0x3, RegisterRole::Argument),
+                test_register_value("rsp", 0x4, RegisterRole::StackPointer),
+            ],
+        };
+
+        let lines = super::render_register_lines(&snapshot, &BTreeSet::new(), None, None, None);
+        let names = lines
+            .iter()
+            .map(|line| line.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["RIP", "RSP", "RAX", "R9"]);
+    }
+
+    #[test]
+    fn register_rendering_marks_changed_registers() {
+        let snapshot = test_register_snapshot(0xd972a0);
+        let changed = BTreeSet::from(["rax".to_string()]);
+
+        let lines = super::render_register_lines(&snapshot, &changed, None, None, None);
+
+        assert!(lines.iter().any(|line| line.name == "RAX" && line.changed));
+        assert!(lines.iter().any(|line| line.name == "RIP" && !line.changed));
+    }
+
+    #[test]
+    fn register_rendering_annotates_exact_heap_user_pointer() {
+        let snapshot = test_register_snapshot(0x1010);
+        let layout = layout_record_with_chunks(1, &[(0x1000, 0x1010)]);
+
+        let lines =
+            super::render_register_lines(&snapshot, &BTreeSet::new(), None, Some(&layout), None);
+
+        assert_eq!(
+            lines
+                .iter()
+                .find(|line| line.name == "RAX")
+                .and_then(|line| line.annotation.as_deref()),
+            Some("heap user")
+        );
+    }
+
+    #[test]
+    fn register_rendering_annotates_interior_heap_pointer() {
+        let snapshot = test_register_snapshot(0x1020);
+        let layout = layout_record_with_chunks(1, &[(0x1000, 0x1010)]);
+
+        let lines =
+            super::render_register_lines(&snapshot, &BTreeSet::new(), None, Some(&layout), None);
+
+        assert_eq!(
+            lines
+                .iter()
+                .find(|line| line.name == "RAX")
+                .and_then(|line| line.annotation.as_deref()),
+            Some("heap")
+        );
+    }
+
+    #[test]
+    fn register_rendering_uses_classifier_for_stack_and_libc_maps() {
+        let mut snapshot = test_register_snapshot(0x7fffffffe000);
+        snapshot.registers.push(test_register_value(
+            "r10",
+            0x7ffff7de0000,
+            RegisterRole::General,
+        ));
+        let maps = test_process_maps();
+
+        let lines =
+            super::render_register_lines(&snapshot, &BTreeSet::new(), Some(&maps), None, None);
+
+        assert_eq!(
+            lines
+                .iter()
+                .find(|line| line.name == "RAX")
+                .and_then(|line| line.annotation.as_deref()),
+            Some("stack")
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .find(|line| line.name == "R10")
+                .and_then(|line| line.annotation.as_deref()),
+            Some("libc")
+        );
+    }
+
+    #[test]
+    fn live_tui_app_register_update_tracks_previous_and_changed() {
+        let mut app = super::LiveTuiApp::default();
+        let first = test_register_snapshot(0x1);
+        let second = test_register_snapshot(0x2);
+
+        app.apply_update(super::LiveTraceUpdate::RegisterSnapshot {
+            event_id: None,
+            snapshot: first.clone(),
+        });
+        app.apply_update(super::LiveTraceUpdate::RegisterSnapshot {
+            event_id: None,
+            snapshot: second.clone(),
+        });
+
+        assert_eq!(app.previous_register_snapshot, Some(first));
+        assert_eq!(app.latest_register_snapshot, Some(second));
+        assert_eq!(app.changed_registers, BTreeSet::from(["rax".to_string()]));
+    }
+
+    #[test]
+    fn live_registers_pane_renders_unavailable_without_snapshot() {
+        let app = super::LiveTuiApp::default();
+
+        assert_eq!(
+            super::format_live_registers_pane(&app),
+            "registers unavailable"
+        );
+    }
+
+    #[test]
+    fn live_registers_pane_renders_summary_with_snapshot() {
+        let mut app = super::LiveTuiApp::default();
+        app.latest_register_snapshot = Some(test_register_snapshot(0xd972a0));
+
+        let rendered = super::format_live_registers_pane(&app);
+
+        assert!(rendered.contains("RIP     0x00000000004011a5"));
+        assert!(rendered.contains("RAX     0x0000000000d972a0"));
+    }
+
+    #[test]
+    fn live_tui_log_buffer_is_bounded() {
+        let mut app = super::LiveTuiApp::default();
+
+        for index in 0..250 {
+            app.push_log_line(format!("line {index}"));
+        }
+
+        assert_eq!(app.logs.len(), 200);
+        assert_eq!(app.logs.front().map(String::as_str), Some("line 50"));
+        assert_eq!(app.logs.back().map(String::as_str), Some("line 249"));
+    }
+
+    #[test]
+    fn live_tui_command_status_appends_log_line() {
+        let mut app = super::LiveTuiApp::default();
+
+        app.apply_update(super::LiveTraceUpdate::CommandStatus {
+            command_id: Some(super::LiveCommandId(7)),
+            command: Some(super::LiveCommand::Pause),
+            status: super::LiveCommandStatus::Completed,
+            target_status: super::LiveTargetStatus::Paused,
+            message: "target paused; inspect panes or resume".to_string(),
+        });
+
+        assert!(app
+            .logs
+            .back()
+            .unwrap()
+            .contains("pause: target paused; inspect panes or resume (completed)"));
+    }
+
+    #[test]
+    fn live_tui_break_matched_appends_log_line() {
+        let mut app = super::LiveTuiApp::default();
+
+        app.apply_update(super::LiveTraceUpdate::BreakMatched(
+            super::AllocatorBreakMatch {
+                condition: super::AllocatorBreakCondition::DoubleFree,
+                event_id: 9,
+                user_addr: None,
+                message: "possible double free".to_string(),
+            },
+        ));
+
+        assert!(app
+            .logs
+            .back()
+            .unwrap()
+            .contains("break condition matched: possible double free after event #9"));
+    }
+
+    #[test]
+    fn live_tui_focus_next_cycles_debugger_panes() {
+        let mut app = super::LiveTuiApp::default();
 
         app.focus_next_pane();
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Console);
+        app.focus_next_pane();
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::RightTab);
+        app.focus_next_pane();
+        assert_eq!(
+            app.focused_debugger_pane,
+            super::LiveDebuggerPane::Registers
+        );
+        app.focus_next_pane();
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Code);
+        app.focus_next_pane();
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Trace);
+    }
 
-        assert_eq!(app.focused_pane, super::LiveTuiPane::Events);
+    #[test]
+    fn live_tui_number_keys_switch_right_tabs() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, _) = std::sync::mpsc::channel();
+
+        for (key, expected) in [
+            ('2', super::LiveRightTab::Stack),
+            ('3', super::LiveRightTab::Logs),
+            ('4', super::LiveRightTab::Maps),
+            ('1', super::LiveRightTab::Heap),
+        ] {
+            let key = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(key),
+                crossterm::event::KeyModifiers::NONE,
+            );
+            super::handle_live_tui_key(key, &mut app, false, &sender);
+            assert_eq!(app.active_right_tab, expected);
+            assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::RightTab);
+        }
+    }
+
+    #[test]
+    fn live_tui_brackets_switch_right_tabs() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, _) = std::sync::mpsc::channel();
+        let next = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(']'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let previous = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('['),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(next, &mut app, false, &sender);
+        assert_eq!(app.active_right_tab, super::LiveRightTab::Stack);
+
+        super::handle_live_tui_key(previous, &mut app, false, &sender);
+        assert_eq!(app.active_right_tab, super::LiveRightTab::Heap);
     }
 
     #[test]
@@ -12427,6 +14505,285 @@ mod tests {
             Some(super::LiveCommandStatus::Rejected)
         );
         assert!(app.status_line.contains("not allowed"));
+    }
+
+    #[test]
+    fn parse_console_command_help_aliases() {
+        assert_eq!(
+            super::parse_console_command("help"),
+            super::ConsoleCommand::Help
+        );
+        assert_eq!(
+            super::parse_console_command("h"),
+            super::ConsoleCommand::Help
+        );
+        assert_eq!(
+            super::parse_console_command("?"),
+            super::ConsoleCommand::Help
+        );
+    }
+
+    #[test]
+    fn parse_console_command_continue_aliases() {
+        assert_eq!(
+            super::parse_console_command("continue"),
+            super::ConsoleCommand::Continue
+        );
+        assert_eq!(
+            super::parse_console_command("c"),
+            super::ConsoleCommand::Continue
+        );
+        assert_eq!(
+            super::parse_console_command("run"),
+            super::ConsoleCommand::Continue
+        );
+    }
+
+    #[test]
+    fn parse_console_command_next_allocator_aliases() {
+        for input in ["next", "n", "next-alloc", "next_allocator_event"] {
+            assert_eq!(
+                super::parse_console_command(input),
+                super::ConsoleCommand::NextAllocatorEvent
+            );
+        }
+    }
+
+    #[test]
+    fn parse_console_command_heap_and_jump_queries() {
+        assert_eq!(
+            super::parse_console_command("heap 0x1010"),
+            super::ConsoleCommand::HeapJump(super::HeapSearchQuery::AnyAddress(0x1010))
+        );
+        assert_eq!(
+            super::parse_console_command("jump u 0x1010"),
+            super::ConsoleCommand::HeapJump(super::HeapSearchQuery::UserAddress(0x1010))
+        );
+        assert_eq!(
+            super::parse_console_command("jump c 0x1000"),
+            super::ConsoleCommand::HeapJump(super::HeapSearchQuery::ChunkAddress(0x1000))
+        );
+        assert_eq!(
+            super::parse_console_command("jump s 0x30"),
+            super::ConsoleCommand::HeapJump(super::HeapSearchQuery::Size(0x30))
+        );
+    }
+
+    #[test]
+    fn parse_console_command_tabs() {
+        assert_eq!(
+            super::parse_console_command("tab heap"),
+            super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Heap)
+        );
+        assert_eq!(
+            super::parse_console_command("tab stack"),
+            super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Stack)
+        );
+        assert_eq!(
+            super::parse_console_command("tab logs"),
+            super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Logs)
+        );
+        assert_eq!(
+            super::parse_console_command("tab maps"),
+            super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Maps)
+        );
+    }
+
+    #[test]
+    fn parse_console_command_unknown() {
+        assert_eq!(
+            super::parse_console_command("wat"),
+            super::ConsoleCommand::Unknown("wat".to_string())
+        );
+    }
+
+    #[test]
+    fn live_tui_colon_starts_console_input() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(':'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(app.console_input_active);
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Console);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_tui_active_console_input_captures_printable_keys() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.console_input_active = true;
+
+        for ch in ['h', 'e', 'l', 'p'] {
+            let key = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            );
+            super::handle_live_tui_key(key, &mut app, false, &sender);
+        }
+
+        assert_eq!(app.console_input, "help");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_tui_esc_cancels_console_input() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, _) = std::sync::mpsc::channel();
+        app.console_input_active = true;
+        app.console_input = "help".to_string();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(!app.console_input_active);
+        assert!(app.console_input.is_empty());
+    }
+
+    #[test]
+    fn live_tui_enter_submits_console_input_and_appends_history() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.console_input_active = true;
+        app.console_input = "help".to_string();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(!app.console_input_active);
+        assert_eq!(app.console_history, vec!["help".to_string()]);
+        assert!(app.logs.iter().any(|line| line.contains("commands: help")));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_tui_console_history_up_down() {
+        let mut app = super::LiveTuiApp::default();
+        app.console_input_active = true;
+        app.console_history = vec!["help".to_string(), "regs".to_string()];
+
+        app.history_previous();
+        assert_eq!(app.console_input, "regs");
+        app.history_previous();
+        assert_eq!(app.console_input, "help");
+        app.history_next();
+        assert_eq!(app.console_input, "regs");
+        app.history_next();
+        assert!(app.console_input.is_empty());
+    }
+
+    #[test]
+    fn console_help_command_writes_command_list() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, _) = std::sync::mpsc::channel();
+
+        super::execute_console_command(
+            &mut app,
+            super::ConsoleCommand::Help,
+            "help",
+            false,
+            &sender,
+        );
+
+        assert!(app.logs.iter().any(|line| line.contains("commands: help")));
+    }
+
+    #[test]
+    fn console_regs_command_focuses_registers() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, _) = std::sync::mpsc::channel();
+
+        super::execute_console_command(
+            &mut app,
+            super::ConsoleCommand::Registers,
+            "regs",
+            false,
+            &sender,
+        );
+
+        assert_eq!(
+            app.focused_debugger_pane,
+            super::LiveDebuggerPane::Registers
+        );
+    }
+
+    #[test]
+    fn console_stack_and_maps_commands_select_tabs() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, _) = std::sync::mpsc::channel();
+
+        super::execute_console_command(
+            &mut app,
+            super::ConsoleCommand::Stack,
+            "stack",
+            false,
+            &sender,
+        );
+        assert_eq!(app.active_right_tab, super::LiveRightTab::Stack);
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::RightTab);
+
+        super::execute_console_command(
+            &mut app,
+            super::ConsoleCommand::Maps,
+            "maps",
+            false,
+            &sender,
+        );
+        assert_eq!(app.active_right_tab, super::LiveRightTab::Maps);
+    }
+
+    #[test]
+    fn console_heap_command_uses_jump_logic_on_success() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, _) = std::sync::mpsc::channel();
+        app.apply_update(super::LiveTraceUpdate::RelatedRecord {
+            event_id: 1,
+            record: layout_record_with_chunks(1, &[(0x1000, 0x1010)]),
+        });
+
+        super::execute_console_command(
+            &mut app,
+            super::ConsoleCommand::HeapJump(super::HeapSearchQuery::UserAddress(0x1010)),
+            "jump u 0x1010",
+            false,
+            &sender,
+        );
+
+        assert_eq!(app.active_right_tab, super::LiveRightTab::Heap);
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::RightTab);
+        assert!(app.show_chunk_inspector);
+        assert_eq!(app.selected_chunk_user_addr, Some(0x1010));
+    }
+
+    #[test]
+    fn console_live_command_sends_existing_command_message() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        super::execute_console_command(
+            &mut app,
+            super::ConsoleCommand::Pause,
+            "pause",
+            false,
+            &sender,
+        );
+
+        assert_eq!(
+            receiver.try_recv().unwrap().command,
+            super::LiveCommand::Pause
+        );
+        assert_eq!(app.status_line, "pause requested...");
     }
 
     #[test]
@@ -12701,7 +15058,8 @@ mod tests {
     #[test]
     fn live_tui_scrolls_focused_non_event_pane() {
         let mut app = super::LiveTuiApp::default();
-        app.focused_pane = super::LiveTuiPane::HeapLayout;
+        app.focused_debugger_pane = super::LiveDebuggerPane::RightTab;
+        app.active_right_tab = super::LiveRightTab::Heap;
 
         app.scroll_focused(3);
 
@@ -12757,9 +15115,9 @@ mod tests {
         );
 
         super::handle_live_tui_key(tab, &mut app, false, &sender);
-        assert_eq!(app.focused_pane, super::LiveTuiPane::EventDetails);
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Console);
         super::handle_live_tui_key(backtab, &mut app, false, &sender);
-        assert_eq!(app.focused_pane, super::LiveTuiPane::Events);
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Trace);
     }
 
     #[test]
@@ -13539,7 +15897,10 @@ mod tests {
                 super::LiveTraceUpdate::RelatedRecord { .. } => "related_record",
                 super::LiveTraceUpdate::Status { .. } => "status",
                 super::LiveTraceUpdate::CommandStatus { .. } => "command_status",
+                super::LiveTraceUpdate::ProcessMaps { .. } => "process_maps",
                 super::LiveTraceUpdate::RegisterSnapshot { .. } => "register_snapshot",
+                super::LiveTraceUpdate::StackSnapshot { .. } => "stack_snapshot",
+                super::LiveTraceUpdate::CodeContext { .. } => "code_context",
                 super::LiveTraceUpdate::BreakMatched(_) => "break_matched",
                 super::LiveTraceUpdate::SessionEnd(_) => "session_end",
             })
@@ -13635,6 +15996,32 @@ mod tests {
     }
 
     #[test]
+    fn live_tui_sink_does_not_write_process_maps_to_json() {
+        let path = unique_temp_path("heapify-live-process-maps-json");
+        let mut writer = super::JsonWriter::file(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let snapshot = test_process_maps();
+
+        {
+            let mut sink = super::LiveTuiSink {
+                sender,
+                json_writer: Some(&mut writer),
+            };
+            sink.on_update(&super::LiveTraceUpdate::ProcessMaps { snapshot })
+                .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::LiveTraceUpdate::ProcessMaps { .. }
+        ));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.is_empty());
+    }
+
+    #[test]
     fn live_tui_sink_does_not_write_register_snapshot_to_json() {
         let path = unique_temp_path("heapify-live-register-snapshot-json");
         let mut writer = super::JsonWriter::file(&path).unwrap();
@@ -13657,6 +16044,70 @@ mod tests {
         assert!(matches!(
             receiver.try_recv().unwrap(),
             super::LiveTraceUpdate::RegisterSnapshot {
+                event_id: Some(1),
+                ..
+            }
+        ));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn live_tui_sink_does_not_write_stack_snapshot_to_json() {
+        let path = unique_temp_path("heapify-live-stack-snapshot-json");
+        let mut writer = super::JsonWriter::file(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let snapshot = test_stack_snapshot(&[0x4011a5]);
+
+        {
+            let mut sink = super::LiveTuiSink {
+                sender,
+                json_writer: Some(&mut writer),
+            };
+            sink.on_update(&super::LiveTraceUpdate::StackSnapshot {
+                event_id: Some(1),
+                snapshot,
+            })
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::LiveTraceUpdate::StackSnapshot {
+                event_id: Some(1),
+                ..
+            }
+        ));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn live_tui_sink_does_not_write_code_context_to_json() {
+        let path = unique_temp_path("heapify-live-code-context-json");
+        let mut writer = super::JsonWriter::file(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let context = test_code_context(0x4011a5);
+
+        {
+            let mut sink = super::LiveTuiSink {
+                sender,
+                json_writer: Some(&mut writer),
+            };
+            sink.on_update(&super::LiveTraceUpdate::CodeContext {
+                event_id: Some(1),
+                context,
+            })
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::LiveTraceUpdate::CodeContext {
                 event_id: Some(1),
                 ..
             }
