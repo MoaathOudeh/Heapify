@@ -62,8 +62,8 @@ scan reports.
 
 User controls flow in the opposite direction:
 
-1. The TUI translates keys such as pause, resume, next allocator event, continue,
-   or stop into live commands.
+1. The TUI translates keys such as pause, resume, next allocator event,
+   instruction step, continue, or stop into live commands.
 2. Commands are sent to the debugger control loop.
 3. The debugger validates target state, applies ptrace control, and emits
    command status updates.
@@ -72,6 +72,22 @@ User controls flow in the opposite direction:
 
 Live inspection is read-only. Heap jumps, pane focus, scrolling, and the chunk
 inspector affect TUI state, not target memory.
+
+Instruction stepping is Linux x86-64 ptrace-based. `stepi` steps one machine
+instruction while the target is paused. `nexti` decodes the current x86-64
+instruction, plants a temporary user-owned breakpoint at a call fall-through
+address when needed, and otherwise behaves like a single instruction step.
+Both refresh live register, code, and stack panes without adding allocator
+events or JSON replay records. Allocator events can still be recorded while
+`nexti` runs, and heap break conditions can interrupt it.
+
+The live Code pane reads a best-effort x86-64 byte window around RIP and uses
+iced-x86 to render a read-only disassembly listing. Pre-RIP instructions are
+shown only when a candidate decode sequence lands exactly on RIP; uncertain
+boundaries are omitted. Direct branch and call targets are annotated from
+symbol metadata when available. `d` recenters the pane at RIP, and `:disas`
+focuses the Code pane and recenters. Source stepping, a source-file viewer,
+memory editing, and interactive breakpoint management remain future work.
 
 v0.81 adds live register snapshot plumbing for Linux x86-64 stops. Snapshots are
 captured as structured data and attached to live TUI state, but there is not yet

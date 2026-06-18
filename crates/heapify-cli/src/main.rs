@@ -46,10 +46,12 @@ use heapify_core::tracker::{
 };
 use heapify_core::HeapTraceEvent;
 use heapify_debugger::{
-    validate_live_command, AllocationTraceMode, AllocatorEventControl, LiveCommand, LiveCommandId,
-    LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, ProcessMapEntry, ProcessMapsSnapshot,
-    ProcessSymbolizer, RegisterRole, RegisterSnapshot, SourceLocation, StackSnapshot, StackWord,
-    StdinConfig, SymbolizedAddress, TargetCommand, TargetSourceMapper, TraceHeapContext,
+    read_disassembly_snapshot, validate_live_command, AllocationTraceMode, AllocatorEventControl,
+    DebuggerStopReason, DisassemblyFlowControl, DisassemblyLine, DisassemblySnapshot, LiveCommand,
+    LiveCommandId, LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, Pid, ProcessMapEntry,
+    ProcessMapsSnapshot, ProcessSymbolizer, RegisterRole, RegisterSnapshot, SourceLocation,
+    StackSnapshot, StackWord, StdinConfig, SymbolizedAddress, TargetCommand, TargetSourceMapper,
+    TraceHeapContext, DEFAULT_DISASSEMBLY_AFTER_BYTES, DEFAULT_DISASSEMBLY_BEFORE_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -483,6 +485,7 @@ pub struct LiveTuiApp {
     pub last_command_status: Option<LiveCommandStatus>,
     pub last_command_message: Option<String>,
     pub last_break_match: Option<AllocatorBreakMatch>,
+    pub latest_stop_reason: Option<DebuggerStopReason>,
     pub follow_tail_before_pause: Option<bool>,
     pub latest_heap_layout: Option<json::JsonTraceRecord>,
     pub latest_allocator_summary: Option<json::JsonTraceRecord>,
@@ -504,6 +507,7 @@ pub struct LiveTuiApp {
     pub focused_pane: LiveTuiPane,
     pub register_pane_scroll: usize,
     pub code_pane_scroll: usize,
+    pub code_follow_rip: bool,
     pub event_details_scroll: usize,
     pub heap_layout_scroll: usize,
     pub allocator_scan_scroll: usize,
@@ -571,14 +575,7 @@ pub struct CodeContext {
     pub symbol_offset: Option<u64>,
     pub object: Option<String>,
     pub source: Option<SourceLocation>,
-    pub disassembly: Vec<DisassemblyLine>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisassemblyLine {
-    pub address: u64,
-    pub text: String,
-    pub is_current: bool,
+    pub disassembly: Option<DisassemblySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -652,8 +649,11 @@ pub enum ConsoleCommand {
     Pause,
     Resume,
     NextAllocatorEvent,
+    StepInstruction,
+    StepInstructionOver,
     Stop,
     Registers,
+    Disassemble,
     Stack,
     Maps,
     HeapJump(HeapSearchQuery),
@@ -686,6 +686,7 @@ impl Default for LiveTuiApp {
             last_command_status: None,
             last_command_message: None,
             last_break_match: None,
+            latest_stop_reason: None,
             follow_tail_before_pause: None,
             latest_heap_layout: None,
             latest_allocator_summary: None,
@@ -707,6 +708,7 @@ impl Default for LiveTuiApp {
             focused_pane: LiveTuiPane::Events,
             register_pane_scroll: 0,
             code_pane_scroll: 0,
+            code_follow_rip: true,
             event_details_scroll: 0,
             heap_layout_scroll: 0,
             allocator_scan_scroll: 0,
@@ -812,6 +814,9 @@ impl LiveTuiApp {
             }
             LiveTraceUpdate::CodeContext { event_id, context } => {
                 self.latest_code_context = Some(context.clone());
+                if self.code_follow_rip {
+                    self.recenter_code_on_rip();
+                }
                 if let Some(event_id) = event_id {
                     self.code_context_by_event_id.insert(event_id, context);
                 }
@@ -829,6 +834,9 @@ impl LiveTuiApp {
                 };
                 self.session_end = Some(session);
                 self.target_status = LiveTargetStatus::Exited;
+                self.latest_stop_reason = Some(DebuggerStopReason::ProcessExit {
+                    status: exit_status.clone(),
+                });
                 self.status_line =
                     format!("target exited: {exit_status}; {event_count} events; press q to quit");
                 self.push_log_line(self.status_line.clone());
@@ -903,6 +911,11 @@ impl LiveTuiApp {
         target_status: LiveTargetStatus,
         message: String,
     ) {
+        if let Some(reason) =
+            Self::infer_debugger_stop_reason(command, status, target_status, &message)
+        {
+            self.latest_stop_reason = Some(reason);
+        }
         self.target_status = target_status;
         self.last_command = command;
         self.last_command_status = Some(status);
@@ -953,6 +966,10 @@ impl LiveTuiApp {
                 self.heap_layout_scroll = index.saturating_sub(3);
             }
         }
+        self.latest_stop_reason = Some(DebuggerStopReason::AllocatorBreakCondition {
+            event_id: break_match.event_id,
+            message: break_match.message.clone(),
+        });
         self.last_break_match = Some(break_match);
     }
 
@@ -1006,6 +1023,96 @@ impl LiveTuiApp {
         }
     }
 
+    fn infer_debugger_stop_reason(
+        command: Option<LiveCommand>,
+        status: LiveCommandStatus,
+        target_status: LiveTargetStatus,
+        message: &str,
+    ) -> Option<DebuggerStopReason> {
+        if target_status == LiveTargetStatus::Exited {
+            return Some(DebuggerStopReason::ProcessExit {
+                status: message.to_string(),
+            });
+        }
+        if target_status != LiveTargetStatus::Paused {
+            return None;
+        }
+        match (command, status) {
+            (Some(LiveCommand::Pause), LiveCommandStatus::Completed) => {
+                Some(DebuggerStopReason::UserPause)
+            }
+            (Some(LiveCommand::StepAllocatorEvent), LiveCommandStatus::Completed) => {
+                Self::parse_allocator_event_id(message)
+                    .map(|event_id| DebuggerStopReason::AllocatorEventStep { event_id })
+            }
+            (Some(LiveCommand::StepInstruction), LiveCommandStatus::Completed) => {
+                Self::parse_hex_transition(message).map(|(from_rip, to_rip)| {
+                    DebuggerStopReason::InstructionStep { from_rip, to_rip }
+                })
+            }
+            (Some(LiveCommand::StepInstructionOver), LiveCommandStatus::Completed) => {
+                Self::parse_hex_transition(message).map(|(from_rip, to_rip)| {
+                    DebuggerStopReason::InstructionStepOver { from_rip, to_rip }
+                })
+            }
+            (
+                Some(LiveCommand::StepInstruction | LiveCommand::StepInstructionOver),
+                LiveCommandStatus::Failed,
+            ) if message.contains("stopped by SIG") => {
+                let signal = Self::parse_signal_number_from_debug_label(message).unwrap_or(0);
+                let instruction_pointer = Self::parse_rip_from_message(message);
+                Some(DebuggerStopReason::Signal {
+                    signal,
+                    instruction_pointer,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_hex_transition(message: &str) -> Option<(u64, u64)> {
+        let mut values = message
+            .split(|ch: char| ch.is_whitespace() || ch == ':' || ch == '-' || ch == '>')
+            .filter_map(|token| token.strip_prefix("0x"))
+            .filter_map(|hex| u64::from_str_radix(hex, 16).ok());
+        Some((values.next()?, values.next()?))
+    }
+
+    fn parse_allocator_event_id(message: &str) -> Option<usize> {
+        let marker = '#';
+        let index = message.find(marker)?;
+        let digits = message[index + marker.len_utf8()..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        digits.parse().ok()
+    }
+
+    fn parse_rip_from_message(message: &str) -> Option<u64> {
+        let marker = "RIP=0x";
+        let index = message.find(marker)?;
+        let hex = message[index + marker.len()..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_hexdigit())
+            .collect::<String>();
+        u64::from_str_radix(&hex, 16).ok()
+    }
+
+    fn parse_signal_number_from_debug_label(message: &str) -> Option<i32> {
+        let signal = message
+            .split_whitespace()
+            .find(|token| token.starts_with("SIG"))?;
+        match signal.trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric()) {
+            "SIGILL" => Some(4),
+            "SIGTRAP" => Some(5),
+            "SIGBUS" => Some(7),
+            "SIGFPE" => Some(8),
+            "SIGSEGV" => Some(11),
+            "SIGSTOP" => Some(19),
+            _ => None,
+        }
+    }
+
     fn focus_next_pane(&mut self) {
         self.focused_debugger_pane = next_live_debugger_pane(self.focused_debugger_pane, 1);
         self.sync_legacy_focus_from_debugger_pane();
@@ -1027,6 +1134,7 @@ impl LiveTuiApp {
             }
             LiveDebuggerPane::Trace => {}
             LiveDebuggerPane::Code => {
+                self.code_follow_rip = false;
                 self.code_pane_scroll = scroll_delta(self.code_pane_scroll, amount);
             }
             LiveDebuggerPane::RightTab => match self.active_right_tab {
@@ -1056,7 +1164,10 @@ impl LiveTuiApp {
         match self.focused_debugger_pane {
             LiveDebuggerPane::Registers => self.register_pane_scroll = 0,
             LiveDebuggerPane::Trace => self.select_first(),
-            LiveDebuggerPane::Code => self.code_pane_scroll = 0,
+            LiveDebuggerPane::Code => {
+                self.code_follow_rip = false;
+                self.code_pane_scroll = 0;
+            }
             LiveDebuggerPane::RightTab => match self.active_right_tab {
                 LiveRightTab::Heap => {
                     self.heap_layout_scroll = 0;
@@ -1075,7 +1186,10 @@ impl LiveTuiApp {
         match self.focused_debugger_pane {
             LiveDebuggerPane::Registers => self.register_pane_scroll = usize::MAX,
             LiveDebuggerPane::Trace => self.select_latest(),
-            LiveDebuggerPane::Code => self.code_pane_scroll = usize::MAX,
+            LiveDebuggerPane::Code => {
+                self.code_follow_rip = false;
+                self.code_pane_scroll = usize::MAX;
+            }
             LiveDebuggerPane::RightTab => match self.active_right_tab {
                 LiveRightTab::Heap => {
                     self.heap_layout_scroll = usize::MAX;
@@ -1120,6 +1234,29 @@ impl LiveTuiApp {
         self.active_right_tab = next_live_right_tab(self.active_right_tab, -1);
         self.focused_debugger_pane = LiveDebuggerPane::RightTab;
         self.sync_legacy_focus_from_debugger_pane();
+    }
+
+    fn focus_code_and_recenter(&mut self) {
+        self.focused_debugger_pane = LiveDebuggerPane::Code;
+        self.sync_legacy_focus_from_debugger_pane();
+        self.code_follow_rip = true;
+        self.recenter_code_on_rip();
+    }
+
+    fn recenter_code_on_rip(&mut self) {
+        let Some(current_line) = self.current_code_render_line_index() else {
+            self.code_pane_scroll = 0;
+            return;
+        };
+        self.code_pane_scroll = current_line.saturating_sub(4);
+    }
+
+    fn current_code_render_line_index(&self) -> Option<usize> {
+        self.latest_code_context
+            .as_ref()
+            .map(format_code_context_lines)?
+            .iter()
+            .position(|line| line.starts_with('>'))
     }
 
     fn reset_selection_scrolls(&mut self) {
@@ -1909,11 +2046,12 @@ fn run_trace_heap_worker(
                 config.stdin.clone(),
                 poll_control,
                 on_control_status,
-                |event_id, snapshot, stack_snapshot| {
+                |event_id, snapshot, stack_snapshot, pid| {
                     if let Some(sender) = &live_sender {
                         let target_symbolizer = target_symbolizer.borrow();
                         let target_source_mapper = target_source_mapper.borrow();
                         let context = build_code_context(
+                            pid,
                             snapshot.instruction_pointer,
                             target_symbolizer.as_ref(),
                             target_source_mapper.as_ref(),
@@ -2623,6 +2761,12 @@ fn handle_live_tui_key(
         KeyCode::Char('n') => {
             send_live_command(app, control_sender, LiveCommand::StepAllocatorEvent);
         }
+        KeyCode::Char('.') => {
+            send_live_command(app, control_sender, LiveCommand::StepInstruction);
+        }
+        KeyCode::Char(',') => {
+            send_live_command(app, control_sender, LiveCommand::StepInstructionOver);
+        }
         KeyCode::Char('c') => {
             send_live_command(app, control_sender, LiveCommand::Continue);
         }
@@ -2635,6 +2779,8 @@ fn handle_live_tui_key(
             }
             LiveTargetStatus::NotStarted
             | LiveTargetStatus::SteppingToNextAllocatorEvent
+            | LiveTargetStatus::SteppingInstruction
+            | LiveTargetStatus::SteppingInstructionOver
             | LiveTargetStatus::Stopping
             | LiveTargetStatus::Exited => {}
         },
@@ -2661,6 +2807,9 @@ fn handle_live_tui_key(
             if app.follow_tail {
                 app.select_latest();
             }
+        }
+        KeyCode::Char('d') if app.focused_debugger_pane == LiveDebuggerPane::Code => {
+            app.focus_code_and_recenter();
         }
         KeyCode::Char('1') => app.set_active_right_tab(LiveRightTab::Heap),
         KeyCode::Char('2') => app.set_active_right_tab(LiveRightTab::Stack),
@@ -2784,7 +2933,7 @@ fn execute_console_command(
     match command {
         ConsoleCommand::Help => {
             app.push_console_output(
-                "commands: help, continue, pause, resume, next, stop, regs, stack, maps, heap ADDR, jump ADDR, tab NAME",
+                "commands: help, continue, pause, resume, next, stepi, si, step, nexti, ni, disas, disassemble, stop, regs, stack, maps, heap ADDR, jump ADDR, tab NAME",
             );
         }
         ConsoleCommand::Continue => {
@@ -2799,6 +2948,12 @@ fn execute_console_command(
         ConsoleCommand::NextAllocatorEvent => {
             send_console_live_command(app, control_sender, LiveCommand::StepAllocatorEvent);
         }
+        ConsoleCommand::StepInstruction => {
+            send_console_live_command(app, control_sender, LiveCommand::StepInstruction);
+        }
+        ConsoleCommand::StepInstructionOver => {
+            send_console_live_command(app, control_sender, LiveCommand::StepInstructionOver);
+        }
         ConsoleCommand::Stop => {
             if app.session_end.is_some() || input_closed {
                 return true;
@@ -2808,6 +2963,9 @@ fn execute_console_command(
         ConsoleCommand::Registers => {
             app.focused_debugger_pane = LiveDebuggerPane::Registers;
             app.sync_legacy_focus_from_debugger_pane();
+        }
+        ConsoleCommand::Disassemble => {
+            app.focus_code_and_recenter();
         }
         ConsoleCommand::Stack => {
             app.set_active_right_tab(LiveRightTab::Stack);
@@ -2942,6 +3100,18 @@ fn apply_sent_live_command(app: &mut LiveTuiApp, command: LiveCommand) {
             app.selected_index = app.events.len().saturating_sub(1);
             app.status_line = "stepping to next allocator event...".to_string();
             app.last_command_message = Some("stepping to next allocator event...".to_string());
+        }
+        LiveCommand::StepInstruction => {
+            app.target_status = LiveTargetStatus::SteppingInstruction;
+            app.follow_tail = false;
+            app.status_line = "waiting for next stop...".to_string();
+            app.last_command_message = Some("waiting for next stop...".to_string());
+        }
+        LiveCommand::StepInstructionOver => {
+            app.target_status = LiveTargetStatus::SteppingInstructionOver;
+            app.follow_tail = false;
+            app.status_line = "waiting for next stop...".to_string();
+            app.last_command_message = Some("waiting for next stop...".to_string());
         }
     }
 }
@@ -3476,15 +3646,12 @@ pub fn build_minimal_code_context(rip: u64) -> CodeContext {
         symbol_offset: None,
         object: None,
         source: None,
-        disassembly: vec![DisassemblyLine {
-            address: rip,
-            text: "<disassembly unavailable>".to_string(),
-            is_current: true,
-        }],
+        disassembly: None,
     }
 }
 
 fn build_code_context(
+    pid: Pid,
     rip: u64,
     symbolizer: Option<&ProcessSymbolizer>,
     source_mapper: Option<&TargetSourceMapper>,
@@ -3503,7 +3670,41 @@ fn build_code_context(
         context.source = source_mapper.and_then(|source_mapper| source_mapper.lookup(rip));
     }
 
+    let mut disassembly = read_disassembly_snapshot(
+        pid,
+        rip,
+        DEFAULT_DISASSEMBLY_BEFORE_BYTES,
+        DEFAULT_DISASSEMBLY_AFTER_BYTES,
+    );
+    annotate_disassembly_targets(&mut disassembly, symbolizer);
+    context.disassembly = Some(disassembly);
+
     context
+}
+
+fn annotate_disassembly_targets(
+    disassembly: &mut DisassemblySnapshot,
+    symbolizer: Option<&ProcessSymbolizer>,
+) {
+    for line in &mut disassembly.lines {
+        if let Some(target) = line.target {
+            line.target_annotation = symbolizer
+                .and_then(|symbolizer| symbolizer.symbolize(target).map(format_symbol_annotation));
+        }
+    }
+}
+
+fn format_symbol_annotation(symbolized: SymbolizedAddress) -> String {
+    let mut formatted = symbolized.symbol;
+    if symbolized.offset > 0 {
+        formatted.push_str(&format!("+0x{:x}", symbolized.offset));
+    }
+    if let Some(object) = symbolized.object_name {
+        if !object.is_empty() && !formatted.contains('!') {
+            formatted = format!("{object}!{formatted}");
+        }
+    }
+    formatted
 }
 
 pub fn format_code_symbol(
@@ -3568,23 +3769,78 @@ pub fn format_code_context_lines(context: &CodeContext) -> Vec<String> {
         "Disassembly:".to_string(),
     ];
 
-    if context.disassembly.is_empty() {
+    if let Some(disassembly) = &context.disassembly {
+        if let Some(error) = disassembly.read_error.as_deref() {
+            lines.push(format!("disassembly truncated: {error}"));
+        } else if disassembly.truncated_before || disassembly.truncated_after {
+            lines.push("disassembly truncated".to_string());
+        }
+        if disassembly.lines.is_empty() {
+            lines.push("disassembly unavailable".to_string());
+        } else {
+            lines.extend(disassembly.lines.iter().map(format_disassembly_line));
+        }
+    } else {
         lines.push(format!(
             "> {}  <disassembly unavailable>",
             format_register_value_fixed_hex(context.instruction_pointer)
         ));
-    } else {
-        lines.extend(context.disassembly.iter().map(|line| {
-            let marker = if line.is_current { ">" } else { " " };
-            format!(
-                "{marker} {}  {}",
-                format_register_value_fixed_hex(line.address),
-                line.text
-            )
-        }));
     }
 
     lines
+}
+
+fn format_disassembly_line(line: &DisassemblyLine) -> String {
+    let marker = if line.is_current { ">" } else { " " };
+    let bytes = format_instruction_bytes(&line.bytes);
+    let mut text = if line.operands.is_empty() {
+        line.mnemonic.clone()
+    } else {
+        format!("{:<7} {}", line.mnemonic, line.operands)
+    };
+    if let Some(target) = line.target {
+        if let Some(annotation) = line.target_annotation.as_deref() {
+            text.push_str(&format!(" <{annotation}>"));
+        } else if matches!(
+            line.flow_control,
+            Some(
+                DisassemblyFlowControl::Call
+                    | DisassemblyFlowControl::ConditionalBranch
+                    | DisassemblyFlowControl::UnconditionalBranch
+            )
+        ) {
+            text.push_str(&format!(" <{}>", format_register_value_fixed_hex(target)));
+        }
+    }
+    format!(
+        "{marker} {}  {:<24} {}",
+        format_register_value_fixed_hex(line.address),
+        truncate_text(&bytes, 24),
+        truncate_text(&text, 96)
+    )
+}
+
+fn format_instruction_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "~".to_string();
+    }
+    let mut truncated = text.chars().take(max_chars - 1).collect::<String>();
+    truncated.push('~');
+    truncated
 }
 
 fn format_live_code_context(app: &LiveTuiApp) -> String {
@@ -3610,7 +3866,7 @@ fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String 
                 .cloned(),
         );
     }
-    lines.push(format!("target: {}", app.target_status.as_str()));
+    lines.push(format!("target={}", app.target_status.as_str()));
     lines.push(format!(
         "follow: {}",
         if app.follow_tail { "on" } else { "off" }
@@ -3630,7 +3886,7 @@ fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String 
     {
         lines.push(message.to_string());
     }
-    lines.push("keys: Tab focus | 1 heap 2 stack 3 logs 4 maps | Space pause/resume | n next event | g jump".to_string());
+    lines.push("keys: Tab focus | 1 heap 2 stack 3 logs 4 maps | Space pause/resume | . stepi | , nexti | n next alloc | c continue".to_string());
     if app.search_prompt_active {
         lines.push(format!("jump> {}", app.search_prompt_input));
     } else if app.console_input_active {
@@ -3793,11 +4049,14 @@ pub fn parse_console_command(input: &str) -> ConsoleCommand {
         ["continue" | "c" | "run"] => ConsoleCommand::Continue,
         ["pause" | "p"] => ConsoleCommand::Pause,
         ["resume" | "r"] => ConsoleCommand::Resume,
+        ["stepi" | "si" | "step"] => ConsoleCommand::StepInstruction,
+        ["nexti" | "ni"] => ConsoleCommand::StepInstructionOver,
         ["next" | "n" | "next-alloc" | "next_allocator_event"] => {
             ConsoleCommand::NextAllocatorEvent
         }
         ["stop" | "quit" | "q"] => ConsoleCommand::Stop,
         ["regs" | "registers"] => ConsoleCommand::Registers,
+        ["disas" | "disassemble"] => ConsoleCommand::Disassemble,
         ["stack"] => ConsoleCommand::Stack,
         ["maps"] => ConsoleCommand::Maps,
         ["heap", rest @ ..] | ["jump", rest @ ..] => {
@@ -13398,11 +13657,25 @@ mod tests {
                 line: Some(42),
                 column: Some(7),
             }),
-            disassembly: vec![super::DisassemblyLine {
-                address: rip,
-                text: "<disassembly unavailable>".to_string(),
-                is_current: true,
-            }],
+            disassembly: Some(super::DisassemblySnapshot {
+                instruction_pointer: rip,
+                start_address: rip,
+                end_address: rip + 1,
+                lines: vec![super::DisassemblyLine {
+                    address: rip,
+                    bytes: vec![0x90],
+                    mnemonic: "nop".to_string(),
+                    operands: String::new(),
+                    text: "nop".to_string(),
+                    is_current: true,
+                    flow_control: None,
+                    target: None,
+                    target_annotation: None,
+                }],
+                truncated_before: false,
+                truncated_after: false,
+                read_error: None,
+            }),
         }
     }
 
@@ -13588,6 +13861,17 @@ mod tests {
 
         assert!(rendered.contains("Disassembly:"));
         assert!(rendered.contains("> 0x00000000004011a5  <disassembly unavailable>"));
+    }
+
+    #[test]
+    fn code_context_retains_metadata_when_disassembly_capture_fails() {
+        let context = super::build_code_context(super::Pid::from_raw(-1), 0x4011a5, None, None);
+
+        assert_eq!(context.instruction_pointer, 0x4011a5);
+        assert_eq!(context.symbol, None);
+        let disassembly = context.disassembly.unwrap();
+        assert!(disassembly.lines.is_empty());
+        assert!(disassembly.read_error.is_some());
     }
 
     #[test]
@@ -13958,16 +14242,29 @@ mod tests {
         let mut app = super::LiveTuiApp::default();
         let (sender, receiver) = std::sync::mpsc::channel();
         app.focused_debugger_pane = super::LiveDebuggerPane::Code;
-        app.latest_code_context = Some(super::CodeContext {
-            disassembly: (0..20)
+        let mut context = test_code_context(0x401000);
+        context.disassembly = Some(super::DisassemblySnapshot {
+            instruction_pointer: 0x401000,
+            start_address: 0x401000,
+            end_address: 0x401014,
+            lines: (0..20)
                 .map(|index| super::DisassemblyLine {
                     address: 0x401000 + index,
+                    bytes: vec![0x90],
+                    mnemonic: "nop".to_string(),
+                    operands: String::new(),
                     text: format!("line {index}"),
                     is_current: index == 0,
+                    flow_control: None,
+                    target: None,
+                    target_annotation: None,
                 })
                 .collect(),
-            ..test_code_context(0x401000)
+            truncated_before: false,
+            truncated_after: false,
+            read_error: None,
         });
+        app.latest_code_context = Some(context);
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::PageDown,
             crossterm::event::KeyModifiers::NONE,
@@ -13976,7 +14273,88 @@ mod tests {
         super::handle_live_tui_key(key, &mut app, false, &sender);
 
         assert_eq!(app.code_pane_scroll, 10);
+        assert!(!app.code_follow_rip);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn code_follow_rip_is_enabled_initially() {
+        let app = super::LiveTuiApp::default();
+
+        assert!(app.code_follow_rip);
+    }
+
+    #[test]
+    fn live_tui_d_recenters_code_pane_and_enables_follow() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.focused_debugger_pane = super::LiveDebuggerPane::Code;
+        app.code_follow_rip = false;
+        app.code_pane_scroll = 99;
+        app.latest_code_context = Some(test_code_context(0x4011a5));
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(app.code_follow_rip);
+        assert!(app.code_pane_scroll < 99);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn parse_console_command_disassemble_aliases() {
+        for input in ["disas", "disassemble"] {
+            assert_eq!(
+                super::parse_console_command(input),
+                super::ConsoleCommand::Disassemble
+            );
+        }
+    }
+
+    #[test]
+    fn console_disas_focuses_code_and_recenters() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.code_follow_rip = false;
+        app.code_pane_scroll = 42;
+        app.latest_code_context = Some(test_code_context(0x4011a5));
+
+        let should_exit = super::execute_console_command(
+            &mut app,
+            super::ConsoleCommand::Disassemble,
+            "disas",
+            false,
+            &sender,
+        );
+
+        assert!(!should_exit);
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Code);
+        assert!(app.code_follow_rip);
+        assert!(app.code_pane_scroll < 42);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn format_code_context_lines_renders_bytes_and_target_annotation() {
+        let mut context = test_code_context(0x4011a5);
+        let disassembly = context.disassembly.as_mut().unwrap();
+        disassembly.lines[0].bytes = vec![0xe8, 0x8a, 0xfe, 0xff, 0xff];
+        disassembly.lines[0].mnemonic = "call".to_string();
+        disassembly.lines[0].operands = "0x401030".to_string();
+        disassembly.lines[0].text = "call 0x401030".to_string();
+        disassembly.lines[0].flow_control = Some(super::DisassemblyFlowControl::Call);
+        disassembly.lines[0].target = Some(0x401030);
+        disassembly.lines[0].target_annotation = Some("malloc@plt".to_string());
+
+        let rendered = super::format_code_context_lines(&context).join("\n");
+
+        assert!(rendered.contains("e8 8a fe ff ff"));
+        assert!(rendered.contains("call"));
+        assert!(rendered.contains("0x401030"));
+        assert!(rendered.contains("<malloc@plt>"));
     }
 
     #[test]
@@ -14403,6 +14781,12 @@ mod tests {
         assert!(app
             .status_line
             .contains("target exited: unknown; 3 events; press q to quit"));
+        assert_eq!(
+            app.latest_stop_reason,
+            Some(super::DebuggerStopReason::ProcessExit {
+                status: "unknown".to_string()
+            })
+        );
     }
 
     #[test]
@@ -14440,6 +14824,10 @@ mod tests {
             app.status_line,
             "target paused; inspect panes or resume".to_string()
         );
+        assert_eq!(
+            app.latest_stop_reason,
+            Some(super::DebuggerStopReason::UserPause)
+        );
     }
 
     #[test]
@@ -14464,6 +14852,33 @@ mod tests {
             super::LiveCommand::StepAllocatorEvent
         )
         .is_ok());
+        assert!(super::validate_live_command(
+            super::LiveTargetStatus::Paused,
+            super::LiveCommand::StepInstruction
+        )
+        .is_ok());
+        assert!(super::validate_live_command(
+            super::LiveTargetStatus::Paused,
+            super::LiveCommand::StepInstructionOver
+        )
+        .is_ok());
+        for status in [
+            super::LiveTargetStatus::NotStarted,
+            super::LiveTargetStatus::Running,
+            super::LiveTargetStatus::SteppingToNextAllocatorEvent,
+            super::LiveTargetStatus::SteppingInstruction,
+            super::LiveTargetStatus::SteppingInstructionOver,
+            super::LiveTargetStatus::Stopping,
+            super::LiveTargetStatus::Exited,
+        ] {
+            assert!(
+                super::validate_live_command(status, super::LiveCommand::StepInstruction).is_err()
+            );
+            assert!(
+                super::validate_live_command(status, super::LiveCommand::StepInstructionOver)
+                    .is_err()
+            );
+        }
         assert!(super::validate_live_command(
             super::LiveTargetStatus::Exited,
             super::LiveCommand::Stop
@@ -14545,6 +14960,26 @@ mod tests {
             assert_eq!(
                 super::parse_console_command(input),
                 super::ConsoleCommand::NextAllocatorEvent
+            );
+        }
+    }
+
+    #[test]
+    fn parse_console_command_step_instruction_aliases() {
+        for input in ["stepi", "si", "step"] {
+            assert_eq!(
+                super::parse_console_command(input),
+                super::ConsoleCommand::StepInstruction
+            );
+        }
+    }
+
+    #[test]
+    fn parse_console_command_step_instruction_over_aliases() {
+        for input in ["nexti", "ni"] {
+            assert_eq!(
+                super::parse_console_command(input),
+                super::ConsoleCommand::StepInstructionOver
             );
         }
     }
@@ -14991,6 +15426,145 @@ mod tests {
         assert!(!should_exit);
         assert!(receiver.try_recv().is_err());
         assert!(app.status_line.contains("not allowed"));
+    }
+
+    #[test]
+    fn live_tui_dot_while_paused_sends_step_instruction() {
+        let mut app = super::LiveTuiApp::default();
+        app.target_status = super::LiveTargetStatus::Paused;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('.'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        let should_exit = super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(!should_exit);
+        assert_eq!(
+            receiver.try_recv().unwrap().command,
+            super::LiveCommand::StepInstruction
+        );
+        assert_eq!(
+            app.target_status,
+            super::LiveTargetStatus::SteppingInstruction
+        );
+        assert_eq!(app.status_line, "waiting for next stop...");
+    }
+
+    #[test]
+    fn live_tui_dot_while_running_does_not_send_step_instruction() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('.'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        let should_exit = super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(!should_exit);
+        assert!(receiver.try_recv().is_err());
+        assert!(app.status_line.contains("not allowed"));
+    }
+
+    #[test]
+    fn live_tui_comma_while_paused_sends_step_instruction_over() {
+        let mut app = super::LiveTuiApp::default();
+        app.target_status = super::LiveTargetStatus::Paused;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(','),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        let should_exit = super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(!should_exit);
+        assert_eq!(
+            receiver.try_recv().unwrap().command,
+            super::LiveCommand::StepInstructionOver
+        );
+        assert_eq!(
+            app.target_status,
+            super::LiveTargetStatus::SteppingInstructionOver
+        );
+        assert_eq!(app.status_line, "waiting for next stop...");
+    }
+
+    #[test]
+    fn live_tui_instruction_step_completion_keeps_target_paused() {
+        let mut app = super::LiveTuiApp::default();
+        app.target_status = super::LiveTargetStatus::SteppingInstruction;
+
+        app.apply_update(super::LiveTraceUpdate::CommandStatus {
+            command_id: Some(super::LiveCommandId(1)),
+            command: Some(super::LiveCommand::StepInstruction),
+            status: super::LiveCommandStatus::Completed,
+            target_status: super::LiveTargetStatus::Paused,
+            message: "stepped instruction: 0x401000 -> 0x401001".to_string(),
+        });
+
+        assert_eq!(app.target_status, super::LiveTargetStatus::Paused);
+        assert_eq!(app.events.len(), 0);
+        assert_eq!(app.status_line, "stepped instruction: 0x401000 -> 0x401001");
+        assert_eq!(
+            app.latest_stop_reason,
+            Some(super::DebuggerStopReason::InstructionStep {
+                from_rip: 0x401000,
+                to_rip: 0x401001
+            })
+        );
+    }
+
+    #[test]
+    fn live_tui_nexti_completion_keeps_target_paused_and_stores_stop_reason() {
+        let mut app = super::LiveTuiApp::default();
+        app.target_status = super::LiveTargetStatus::SteppingInstructionOver;
+
+        app.apply_update(super::LiveTraceUpdate::CommandStatus {
+            command_id: Some(super::LiveCommandId(1)),
+            command: Some(super::LiveCommand::StepInstructionOver),
+            status: super::LiveCommandStatus::Completed,
+            target_status: super::LiveTargetStatus::Paused,
+            message: "nexti completed: 0x401000 -> 0x401005".to_string(),
+        });
+
+        assert_eq!(app.target_status, super::LiveTargetStatus::Paused);
+        assert_eq!(app.events.len(), 0);
+        assert_eq!(
+            app.latest_stop_reason,
+            Some(super::DebuggerStopReason::InstructionStepOver {
+                from_rip: 0x401000,
+                to_rip: 0x401005
+            })
+        );
+    }
+
+    #[test]
+    fn live_tui_instruction_step_updates_refresh_debugger_context_without_event() {
+        let mut app = super::LiveTuiApp::default();
+
+        app.apply_update(super::LiveTraceUpdate::RegisterSnapshot {
+            event_id: None,
+            snapshot: test_register_snapshot(0x1),
+        });
+        app.apply_update(super::LiveTraceUpdate::CodeContext {
+            event_id: None,
+            context: test_code_context(0x401001),
+        });
+        app.apply_update(super::LiveTraceUpdate::StackSnapshot {
+            event_id: None,
+            snapshot: test_stack_snapshot(&[0x401001]),
+        });
+
+        assert!(app.latest_register_snapshot.is_some());
+        assert!(app.latest_code_context.is_some());
+        assert!(app.latest_stack_snapshot.is_some());
+        assert!(app.register_snapshots_by_event_id.is_empty());
+        assert!(app.code_context_by_event_id.is_empty());
+        assert!(app.stack_snapshots_by_event_id.is_empty());
+        assert!(app.events.is_empty());
     }
 
     #[test]
@@ -15826,12 +16400,28 @@ mod tests {
             super::LiveCommand::StepAllocatorEvent.as_str(),
             "step_allocator_event"
         );
+        assert_eq!(
+            super::LiveCommand::StepInstruction.as_str(),
+            "step_instruction"
+        );
+        assert_eq!(
+            super::LiveCommand::StepInstructionOver.as_str(),
+            "step_instruction_over"
+        );
         assert_eq!(super::LiveTargetStatus::NotStarted.as_str(), "not_started");
         assert_eq!(super::LiveTargetStatus::Running.as_str(), "running");
         assert_eq!(super::LiveTargetStatus::Paused.as_str(), "paused");
         assert_eq!(
             super::LiveTargetStatus::SteppingToNextAllocatorEvent.as_str(),
             "stepping_to_next_allocator_event"
+        );
+        assert_eq!(
+            super::LiveTargetStatus::SteppingInstruction.as_str(),
+            "stepping_instruction"
+        );
+        assert_eq!(
+            super::LiveTargetStatus::SteppingInstructionOver.as_str(),
+            "stepping_instruction_over"
         );
         assert_eq!(super::LiveTargetStatus::Stopping.as_str(), "stopping");
         assert_eq!(super::LiveTargetStatus::Exited.as_str(), "exited");
@@ -16112,6 +16702,57 @@ mod tests {
                 ..
             }
         ));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn instruction_step_live_only_updates_are_ignored_by_json_sink() {
+        let path = unique_temp_path("heapify-instruction-step-live-only-json");
+        let mut writer = super::JsonWriter::file(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        {
+            let mut sink = super::LiveTuiSink {
+                sender,
+                json_writer: Some(&mut writer),
+            };
+            sink.on_update(&super::LiveTraceUpdate::CommandStatus {
+                command_id: Some(super::LiveCommandId(1)),
+                command: Some(super::LiveCommand::StepInstruction),
+                status: super::LiveCommandStatus::Completed,
+                target_status: super::LiveTargetStatus::Paused,
+                message: "stepped instruction: 0x401000 -> 0x401001".to_string(),
+            })
+            .unwrap();
+            sink.on_update(&super::LiveTraceUpdate::CommandStatus {
+                command_id: Some(super::LiveCommandId(2)),
+                command: Some(super::LiveCommand::StepInstructionOver),
+                status: super::LiveCommandStatus::Completed,
+                target_status: super::LiveTargetStatus::Paused,
+                message: "nexti completed: 0x401001 -> 0x401006".to_string(),
+            })
+            .unwrap();
+            sink.on_update(&super::LiveTraceUpdate::RegisterSnapshot {
+                event_id: None,
+                snapshot: test_register_snapshot(0x1),
+            })
+            .unwrap();
+            sink.on_update(&super::LiveTraceUpdate::StackSnapshot {
+                event_id: None,
+                snapshot: test_stack_snapshot(&[0x401001]),
+            })
+            .unwrap();
+            sink.on_update(&super::LiveTraceUpdate::CodeContext {
+                event_id: None,
+                context: test_code_context(0x401001),
+            })
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert_eq!(receiver.try_iter().count(), 5);
         let contents = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(contents.is_empty());

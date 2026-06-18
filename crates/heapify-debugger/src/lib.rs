@@ -28,13 +28,15 @@ pub use heapify_core::glibc::{
 };
 use heapify_core::tracker::{HeapTracker, ObservedChunkState};
 use heapify_core::HeapTraceEvent;
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter};
 use maps::{
     find_executable_mapping, find_libc_mapping, mapping_load_base, read_process_maps, MemoryMapping,
 };
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{execvp, fork, ForkResult, Pid};
+pub use nix::unistd::Pid;
+use nix::unistd::{execvp, fork, ForkResult};
 use object::{Object, ObjectSection};
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +109,52 @@ pub struct StackSnapshot {
     pub read_error: Option<String>,
 }
 
+pub const DEFAULT_DISASSEMBLY_BEFORE_BYTES: usize = 96;
+pub const DEFAULT_DISASSEMBLY_AFTER_BYTES: usize = 160;
+pub const DEFAULT_DISASSEMBLY_MAX_INSTRUCTIONS: usize = 24;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisassemblySnapshot {
+    pub instruction_pointer: u64,
+    pub start_address: u64,
+    pub end_address: u64,
+    pub lines: Vec<DisassemblyLine>,
+    pub truncated_before: bool,
+    pub truncated_after: bool,
+    pub read_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisassemblyLine {
+    pub address: u64,
+    pub bytes: Vec<u8>,
+    pub mnemonic: String,
+    pub operands: String,
+    pub text: String,
+    pub is_current: bool,
+    pub flow_control: Option<DisassemblyFlowControl>,
+    pub target: Option<u64>,
+    pub target_annotation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisassemblyFlowControl {
+    Call,
+    ConditionalBranch,
+    UnconditionalBranch,
+    Return,
+    Interrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedInstruction {
+    pub instruction_pointer: u64,
+    pub length: u32,
+    pub flow_control: String,
+    pub is_call: bool,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackWord {
     pub offset_from_sp: i64,
@@ -161,6 +209,273 @@ impl From<MemoryMapping> for ProcessMapEntry {
 
 pub fn read_stack_snapshot(pid: Pid, stack_pointer: u64, word_count: usize) -> StackSnapshot {
     read_stack_snapshot_with_reader(stack_pointer, word_count, |addr| read_word(pid, addr))
+}
+
+pub trait TargetMemoryReader {
+    fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>>;
+}
+
+struct PtraceMemoryReader {
+    pid: Pid,
+}
+
+impl TargetMemoryReader for PtraceMemoryReader {
+    fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>> {
+        read_process_memory(self.pid, address, size)
+    }
+}
+
+pub fn read_disassembly_snapshot(
+    pid: Pid,
+    rip: u64,
+    before_bytes: usize,
+    after_bytes: usize,
+) -> DisassemblySnapshot {
+    read_disassembly_snapshot_with_reader(
+        &PtraceMemoryReader { pid },
+        rip,
+        before_bytes,
+        after_bytes,
+        DEFAULT_DISASSEMBLY_MAX_INSTRUCTIONS,
+    )
+}
+
+pub fn read_disassembly_snapshot_with_reader(
+    reader: &impl TargetMemoryReader,
+    rip: u64,
+    before_bytes: usize,
+    after_bytes: usize,
+    max_instructions: usize,
+) -> DisassemblySnapshot {
+    let start_address = rip.saturating_sub(before_bytes as u64);
+    let requested_before = rip.saturating_sub(start_address) as usize;
+    let requested_size = requested_before.saturating_add(after_bytes.max(15));
+    let mut snapshot = DisassemblySnapshot {
+        instruction_pointer: rip,
+        start_address,
+        end_address: start_address,
+        lines: Vec::new(),
+        truncated_before: start_address == 0 && before_bytes > requested_before,
+        truncated_after: false,
+        read_error: None,
+    };
+
+    let bytes = match reader.read_memory(start_address, requested_size) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            snapshot.truncated_before = requested_before > 0;
+            snapshot.truncated_after = after_bytes > 0;
+            snapshot.read_error = Some(err.to_string());
+            return snapshot;
+        }
+    };
+    snapshot.end_address = start_address.saturating_add(bytes.len() as u64);
+
+    let rip_offset = rip.saturating_sub(start_address) as usize;
+    if rip_offset >= bytes.len() {
+        snapshot.truncated_after = true;
+        snapshot.read_error = Some("instruction pointer is outside readable window".to_string());
+        return snapshot;
+    }
+
+    let before_window = &bytes[..rip_offset];
+    let after_window = &bytes[rip_offset..];
+    let current_and_after_limit = max_instructions.saturating_add(1);
+    let mut forward_lines = decode_disassembly_sequence(rip, after_window, current_and_after_limit);
+    if forward_lines.is_empty() {
+        snapshot.truncated_after = true;
+        snapshot.read_error = Some("failed to decode instruction at RIP".to_string());
+        return snapshot;
+    }
+    if decoded_bytes_len(&forward_lines) < after_window.len() {
+        snapshot.truncated_after = true;
+    }
+
+    let before_limit = max_instructions.saturating_sub(1) / 2;
+    let preceding = recover_preceding_disassembly(start_address, before_window, rip, before_limit);
+    if before_window.is_empty() {
+        snapshot.truncated_before = snapshot.truncated_before || before_bytes > 0;
+    } else if preceding.is_empty() {
+        snapshot.truncated_before = true;
+    }
+
+    let mut lines = preceding;
+    for line in &mut forward_lines {
+        line.is_current = line.address == rip;
+    }
+    lines.extend(forward_lines);
+    if lines.len() > max_instructions {
+        let original_len = lines.len();
+        let current_index = lines.iter().position(|line| line.is_current).unwrap_or(0);
+        let before_count = before_limit.min(current_index);
+        let after_count = max_instructions.saturating_sub(before_count);
+        let start = current_index.saturating_sub(before_count);
+        let end = (start + after_count).min(lines.len());
+        lines = lines[start..end].to_vec();
+        snapshot.truncated_before = snapshot.truncated_before || start > 0;
+        snapshot.truncated_after = snapshot.truncated_after || end < original_len;
+    }
+
+    snapshot.lines = lines;
+    snapshot
+}
+
+fn recover_preceding_disassembly(
+    start_address: u64,
+    bytes: &[u8],
+    rip: u64,
+    max_lines: usize,
+) -> Vec<DisassemblyLine> {
+    if bytes.is_empty() || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut best = Vec::new();
+    for offset in 0..bytes.len() {
+        let candidate_addr = start_address.saturating_add(offset as u64);
+        let decoded = decode_disassembly_sequence(candidate_addr, &bytes[offset..], max_lines + 32);
+        let lands_on_rip = decoded.iter().any(|line| {
+            let end = line.address.saturating_add(line.bytes.len() as u64);
+            end == rip
+        });
+        let stops_at_rip = decoded
+            .last()
+            .map(|line| line.address.saturating_add(line.bytes.len() as u64) == rip)
+            .unwrap_or(false);
+        if lands_on_rip && stops_at_rip {
+            best = decoded;
+            break;
+        }
+    }
+
+    if best.len() > max_lines {
+        best[best.len() - max_lines..].to_vec()
+    } else {
+        best
+    }
+}
+
+fn decode_disassembly_sequence(
+    start_address: u64,
+    bytes: &[u8],
+    max_instructions: usize,
+) -> Vec<DisassemblyLine> {
+    let mut decoder = Decoder::with_ip(64, bytes, start_address, DecoderOptions::NONE);
+    let mut lines = Vec::new();
+    while decoder.can_decode() && lines.len() < max_instructions {
+        let offset = decoder.position();
+        let instruction = decoder.decode();
+        if instruction.is_invalid() || instruction.len() == 0 {
+            break;
+        }
+        let end = offset.saturating_add(instruction.len());
+        if end > bytes.len() {
+            break;
+        }
+        lines.push(disassembly_line_from_iced(
+            instruction,
+            bytes[offset..end].to_vec(),
+        ));
+    }
+    lines
+}
+
+fn decoded_bytes_len(lines: &[DisassemblyLine]) -> usize {
+    lines.iter().map(|line| line.bytes.len()).sum()
+}
+
+fn disassembly_line_from_iced(instruction: Instruction, bytes: Vec<u8>) -> DisassemblyLine {
+    let flow_control = disassembly_flow_control(instruction.flow_control());
+    let target = direct_branch_target(&instruction);
+    let mut formatter = NasmFormatter::new();
+    let mut text = String::new();
+    formatter.format(&instruction, &mut text);
+    let (mnemonic, operands) = split_instruction_text(&text);
+    DisassemblyLine {
+        address: instruction.ip(),
+        bytes,
+        mnemonic,
+        operands,
+        text,
+        is_current: false,
+        flow_control,
+        target,
+        target_annotation: None,
+    }
+}
+
+fn split_instruction_text(text: &str) -> (String, String) {
+    let trimmed = text.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let mnemonic = parts.next().unwrap_or_default().to_string();
+    let operands = parts.next().unwrap_or_default().trim().to_string();
+    (mnemonic, operands)
+}
+
+fn disassembly_flow_control(flow_control: FlowControl) -> Option<DisassemblyFlowControl> {
+    match flow_control {
+        FlowControl::Call | FlowControl::IndirectCall => Some(DisassemblyFlowControl::Call),
+        FlowControl::ConditionalBranch => Some(DisassemblyFlowControl::ConditionalBranch),
+        FlowControl::UnconditionalBranch | FlowControl::IndirectBranch => {
+            Some(DisassemblyFlowControl::UnconditionalBranch)
+        }
+        FlowControl::Return => Some(DisassemblyFlowControl::Return),
+        FlowControl::Interrupt => Some(DisassemblyFlowControl::Interrupt),
+        _ => None,
+    }
+}
+
+fn direct_branch_target(instruction: &Instruction) -> Option<u64> {
+    match instruction.flow_control() {
+        FlowControl::Call | FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
+            Some(instruction.near_branch_target())
+        }
+        _ => None,
+    }
+}
+
+pub fn decode_instruction_at_rip(pid: Pid, rip: u64) -> Result<DecodedInstruction> {
+    let mut bytes = [0u8; 15];
+    for offset in (0..15).step_by(8) {
+        let word = if offset == 0 {
+            read_word(pid, rip)?
+        } else {
+            read_word(pid, rip + offset as u64).unwrap_or(0)
+        };
+        let word_bytes = word.to_le_bytes();
+        let len = (15 - offset).min(8);
+        bytes[offset..offset + len].copy_from_slice(&word_bytes[..len]);
+    }
+    decode_x86_64_instruction(rip, &bytes)
+}
+
+fn decode_x86_64_instruction(rip: u64, bytes: &[u8]) -> Result<DecodedInstruction> {
+    let mut decoder = Decoder::with_ip(64, bytes, rip, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() || instruction.len() == 0 {
+        bail!("failed to decode instruction at 0x{rip:x}");
+    }
+    Ok(decoded_instruction_from_iced(instruction))
+}
+
+fn decoded_instruction_from_iced(instruction: Instruction) -> DecodedInstruction {
+    let flow_control = instruction.flow_control();
+    let mut formatter = NasmFormatter::new();
+    let mut text = String::new();
+    formatter.format(&instruction, &mut text);
+    DecodedInstruction {
+        instruction_pointer: instruction.ip(),
+        length: instruction.len() as u32,
+        flow_control: format!("{flow_control:?}"),
+        is_call: matches!(flow_control, FlowControl::Call | FlowControl::IndirectCall),
+        text,
+    }
+}
+
+fn decoded_instruction_fallthrough(instruction: &DecodedInstruction) -> u64 {
+    instruction
+        .instruction_pointer
+        .saturating_add(u64::from(instruction.length))
 }
 
 fn read_stack_snapshot_with_reader(
@@ -263,6 +578,8 @@ pub enum LiveCommand {
     Resume,
     Continue,
     StepAllocatorEvent,
+    StepInstruction,
+    StepInstructionOver,
 }
 
 impl LiveCommand {
@@ -273,6 +590,8 @@ impl LiveCommand {
             LiveCommand::Resume => "resume",
             LiveCommand::Continue => "continue",
             LiveCommand::StepAllocatorEvent => "step_allocator_event",
+            LiveCommand::StepInstruction => "step_instruction",
+            LiveCommand::StepInstructionOver => "step_instruction_over",
         }
     }
 }
@@ -292,6 +611,8 @@ pub enum LiveTargetStatus {
     Running,
     Paused,
     SteppingToNextAllocatorEvent,
+    SteppingInstruction,
+    SteppingInstructionOver,
     Stopping,
     Exited,
 }
@@ -303,6 +624,8 @@ impl LiveTargetStatus {
             LiveTargetStatus::Running => "running",
             LiveTargetStatus::Paused => "paused",
             LiveTargetStatus::SteppingToNextAllocatorEvent => "stepping_to_next_allocator_event",
+            LiveTargetStatus::SteppingInstruction => "stepping_instruction",
+            LiveTargetStatus::SteppingInstructionOver => "stepping_instruction_over",
             LiveTargetStatus::Stopping => "stopping",
             LiveTargetStatus::Exited => "exited",
         }
@@ -336,7 +659,10 @@ pub fn validate_live_command(
         LiveCommand::Stop => target_status != LiveTargetStatus::Exited,
         LiveCommand::Pause => matches!(
             target_status,
-            LiveTargetStatus::Running | LiveTargetStatus::SteppingToNextAllocatorEvent
+            LiveTargetStatus::Running
+                | LiveTargetStatus::SteppingToNextAllocatorEvent
+                | LiveTargetStatus::SteppingInstruction
+                | LiveTargetStatus::SteppingInstructionOver
         ),
         LiveCommand::Resume => target_status == LiveTargetStatus::Paused,
         LiveCommand::Continue => matches!(
@@ -344,6 +670,9 @@ pub fn validate_live_command(
             LiveTargetStatus::Paused | LiveTargetStatus::SteppingToNextAllocatorEvent
         ),
         LiveCommand::StepAllocatorEvent => target_status == LiveTargetStatus::Paused,
+        LiveCommand::StepInstruction | LiveCommand::StepInstructionOver => {
+            target_status == LiveTargetStatus::Paused
+        }
     };
 
     if allowed {
@@ -361,6 +690,114 @@ pub fn validate_live_command(
 enum LiveTraceRunMode {
     Continuous,
     StepAllocatorEvent,
+    UserInstructionStepOver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    InternalBreakpointStepOver,
+    UserInstructionStep,
+    UserInstructionStepOver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebuggerStopReason {
+    UserPause,
+    AllocatorEventStep {
+        event_id: usize,
+    },
+    InstructionStep {
+        from_rip: u64,
+        to_rip: u64,
+    },
+    InstructionStepOver {
+        from_rip: u64,
+        to_rip: u64,
+    },
+    AllocatorBreakCondition {
+        event_id: usize,
+        message: String,
+    },
+    Signal {
+        signal: i32,
+        instruction_pointer: Option<u64>,
+    },
+    ProcessExit {
+        status: String,
+    },
+}
+
+impl DebuggerStopReason {
+    pub fn summary_line(&self) -> String {
+        match self {
+            DebuggerStopReason::UserPause => "paused by user".to_string(),
+            DebuggerStopReason::AllocatorEventStep { event_id } => {
+                format!("paused after allocator event #{event_id}")
+            }
+            DebuggerStopReason::InstructionStep { from_rip, to_rip } => {
+                format!("stepped instruction: 0x{from_rip:x} -> 0x{to_rip:x}")
+            }
+            DebuggerStopReason::InstructionStepOver { from_rip, to_rip } => {
+                format!("nexti completed: 0x{from_rip:x} -> 0x{to_rip:x}")
+            }
+            DebuggerStopReason::AllocatorBreakCondition { event_id, message } => {
+                format!("break condition matched after event #{event_id}: {message}")
+            }
+            DebuggerStopReason::Signal {
+                signal,
+                instruction_pointer,
+            } => match instruction_pointer {
+                Some(rip) => format!("stopped by signal {signal} at RIP=0x{rip:x}"),
+                None => format!("stopped by signal {signal}"),
+            },
+            DebuggerStopReason::ProcessExit { status } => format!("target exited: {status}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveWorkerPauseState {
+    ptrace_stopped: bool,
+    user_visible_paused: bool,
+    step_in_flight: Option<StepKind>,
+    temporary_return_breakpoint_in_flight: bool,
+    managed_breakpoints_rearmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingInstructionStepOver {
+    command_id: LiveCommandId,
+    from_rip: u64,
+    breakpoint_addr: u64,
+}
+
+impl LiveWorkerPauseState {
+    #[cfg(test)]
+    fn stable_user_pause() -> Self {
+        Self {
+            ptrace_stopped: true,
+            user_visible_paused: true,
+            step_in_flight: None,
+            temporary_return_breakpoint_in_flight: false,
+            managed_breakpoints_rearmed: true,
+        }
+    }
+
+    fn can_user_step_instruction(&self) -> std::result::Result<(), String> {
+        if self.ptrace_stopped
+            && self.user_visible_paused
+            && self.step_in_flight.is_none()
+            && !self.temporary_return_breakpoint_in_flight
+            && self.managed_breakpoints_rearmed
+        {
+            Ok(())
+        } else {
+            Err(
+                "cannot step instruction while Heapify is resolving an internal breakpoint"
+                    .to_string(),
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +810,12 @@ pub enum AllocatorEventControl {
 enum TraceWaitMode {
     Blocking,
     Controlled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveControlOutcome {
+    Continue,
+    TargetExited,
 }
 
 impl TargetCommand {
@@ -593,9 +1036,42 @@ pub enum BreakpointKind {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreakpointPurpose {
+    ManagedAllocatorEntry,
+    ManagedAllocatorReturn,
+    UserInstructionStepOver,
+}
+
+#[derive(Debug, Clone)]
+pub enum BreakpointOwner {
+    Allocator(BreakpointKind),
+    UserInstructionStepOver {
+        command_id: LiveCommandId,
+        from_rip: u64,
+    },
+}
+
+impl BreakpointOwner {
+    fn purpose(&self) -> BreakpointPurpose {
+        match self {
+            BreakpointOwner::Allocator(
+                BreakpointKind::MallocEntry
+                | BreakpointKind::FreeEntry
+                | BreakpointKind::CallocEntry
+                | BreakpointKind::ReallocEntry,
+            ) => BreakpointPurpose::ManagedAllocatorEntry,
+            BreakpointOwner::Allocator(_) => BreakpointPurpose::ManagedAllocatorReturn,
+            BreakpointOwner::UserInstructionStepOver { .. } => {
+                BreakpointPurpose::UserInstructionStepOver
+            }
+        }
+    }
+}
+
 pub struct ManagedBreakpoint {
     pub breakpoint: Breakpoint,
-    pub kind: BreakpointKind,
+    pub owners: Vec<BreakpointOwner>,
 }
 
 #[derive(Default)]
@@ -605,13 +1081,48 @@ pub struct BreakpointManager {
 
 impl BreakpointManager {
     pub fn set_breakpoint(&mut self, pid: Pid, addr: u64, kind: BreakpointKind) -> Result<()> {
+        self.add_owner(pid, addr, BreakpointOwner::Allocator(kind))
+    }
+
+    fn set_user_step_over_breakpoint(
+        &mut self,
+        pid: Pid,
+        addr: u64,
+        command_id: LiveCommandId,
+        from_rip: u64,
+    ) -> Result<()> {
+        self.add_owner(
+            pid,
+            addr,
+            BreakpointOwner::UserInstructionStepOver {
+                command_id,
+                from_rip,
+            },
+        )
+    }
+
+    fn add_owner(&mut self, pid: Pid, addr: u64, owner: BreakpointOwner) -> Result<()> {
+        if let Some(managed) = self.breakpoints.get_mut(&addr) {
+            managed.owners.push(owner);
+            managed
+                .breakpoint
+                .enable(pid)
+                .with_context(|| format!("failed to enable breakpoint at 0x{addr:x}"))?;
+            return Ok(());
+        }
+
         let mut breakpoint = Breakpoint::new(addr);
         breakpoint
             .enable(pid)
             .with_context(|| format!("failed to enable breakpoint at 0x{addr:x}"))?;
 
-        self.breakpoints
-            .insert(addr, ManagedBreakpoint { breakpoint, kind });
+        self.breakpoints.insert(
+            addr,
+            ManagedBreakpoint {
+                breakpoint,
+                owners: vec![owner],
+            },
+        );
         Ok(())
     }
 
@@ -623,12 +1134,80 @@ impl BreakpointManager {
         self.breakpoints.get_mut(&addr)
     }
 
-    pub fn remove(&mut self, addr: u64) -> Option<ManagedBreakpoint> {
-        self.breakpoints.remove(&addr)
+    fn remove_owner_at(
+        &mut self,
+        pid: Pid,
+        addr: u64,
+        predicate: impl FnMut(&BreakpointOwner) -> bool,
+    ) -> Result<Option<BreakpointOwner>> {
+        let mut should_remove_physical = false;
+        let removed = if let Some(managed) = self.breakpoints.get_mut(&addr) {
+            let Some(index) = managed.owners.iter().position(predicate) else {
+                return Ok(None);
+            };
+            let owner = managed.owners.remove(index);
+            if managed.owners.is_empty() {
+                managed
+                    .breakpoint
+                    .disable(pid)
+                    .with_context(|| format!("failed to disable breakpoint at 0x{addr:x}"))?;
+                should_remove_physical = true;
+            }
+            Some(owner)
+        } else {
+            None
+        };
+        if should_remove_physical {
+            self.breakpoints.remove(&addr);
+        }
+        Ok(removed)
     }
 
-    fn insert_managed(&mut self, managed: ManagedBreakpoint) {
-        self.breakpoints.insert(managed.breakpoint.addr, managed);
+    fn remove_user_step_over_breakpoint(&mut self, pid: Pid, addr: u64) -> Result<()> {
+        self.remove_owner_at(pid, addr, |owner| {
+            matches!(owner, BreakpointOwner::UserInstructionStepOver { .. })
+        })?;
+        Ok(())
+    }
+
+    fn user_step_over_owner(&self, addr: u64) -> Option<(LiveCommandId, u64)> {
+        self.breakpoints
+            .get(&addr)?
+            .owners
+            .iter()
+            .find_map(|owner| match owner {
+                BreakpointOwner::UserInstructionStepOver {
+                    command_id,
+                    from_rip,
+                } => Some((*command_id, *from_rip)),
+                _ => None,
+            })
+    }
+
+    fn allocator_owner(&self, addr: u64) -> Option<BreakpointKind> {
+        self.breakpoints
+            .get(&addr)?
+            .owners
+            .iter()
+            .find_map(|owner| match owner {
+                BreakpointOwner::Allocator(kind) => Some(kind.clone()),
+                _ => None,
+            })
+    }
+
+    fn all_breakpoints_rearmed(&self) -> bool {
+        self.breakpoints
+            .values()
+            .all(|managed| managed.breakpoint.enabled)
+    }
+
+    fn has_temporary_return_breakpoints(&self) -> bool {
+        self.breakpoints.values().any(|managed| {
+            managed
+                .owners
+                .iter()
+                .any(|owner| matches!(owner.purpose(), BreakpointPurpose::ManagedAllocatorReturn))
+        })
     }
 }
 
@@ -1164,7 +1743,7 @@ where
         stdin,
         || None,
         |_, _, _, _, _| Ok(()),
-        |_, _, _| Ok(()),
+        |_, _, _, _| Ok(()),
         TraceWaitMode::Blocking,
     )
 }
@@ -1202,7 +1781,7 @@ where
         LiveTargetStatus,
         String,
     ) -> Result<()>,
-    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
 {
     trace_heap_with_status_mode_profile_session_control(
         program,
@@ -1262,7 +1841,7 @@ where
         LiveTargetStatus,
         String,
     ) -> Result<()>,
-    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
 {
     let launch_config = LaunchConfig {
         target_program: PathBuf::from(program),
@@ -1486,7 +2065,7 @@ where
         LiveTargetStatus,
         String,
     ) -> Result<()>,
-    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
 {
     wait_for_initial_stop_with_status(child, show_status)?;
     let program_path = exec_plan
@@ -1607,10 +2186,11 @@ where
     let mut target_status = LiveTargetStatus::Running;
     let mut pending_pause_command_id = None;
     let mut pending_step_command_id = None;
+    let mut pending_nexti = None;
     let mut stop_requested_at = None;
     loop {
         if matches!(wait_mode, TraceWaitMode::Controlled) {
-            handle_live_trace_controls(
+            if handle_live_trace_controls(
                 child,
                 &mut poll_control,
                 &mut on_control_status,
@@ -1620,8 +2200,16 @@ where
                 &mut target_status,
                 &mut pending_pause_command_id,
                 &mut pending_step_command_id,
+                &mut pending_nexti,
                 &mut stop_requested_at,
-            )?;
+                &mut breakpoints,
+                &mut on_register_snapshot,
+            )? == LiveControlOutcome::TargetExited
+            {
+                print_missing_libc_metadata_at_trace_end(&mut state);
+                finish_stdin_writer(stdin_writer.take())?;
+                return Ok(());
+            }
             if paused {
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
@@ -1684,6 +2272,32 @@ where
                 return Ok(());
             }
             WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {
+                let hit_addr = ptrace::getregs(child)
+                    .ok()
+                    .map(|regs| regs.rip.saturating_sub(1));
+                if pending_nexti
+                    .zip(hit_addr)
+                    .map(|(pending, hit_addr)| {
+                        pending.breakpoint_addr == hit_addr
+                            && breakpoints.user_step_over_owner(hit_addr).is_some()
+                    })
+                    .unwrap_or(false)
+                {
+                    let pending = pending_nexti.take().unwrap();
+                    handle_user_step_over_breakpoint_hit(
+                        child,
+                        &mut breakpoints,
+                        pending,
+                        &mut on_register_snapshot,
+                        &mut on_control_status,
+                    )?;
+                    run_mode = LiveTraceRunMode::Continuous;
+                    paused = true;
+                    pause_requested = false;
+                    target_status = LiveTargetStatus::Paused;
+                    continue;
+                }
+
                 let emitted_allocator_event =
                     handle_managed_breakpoint_hit(child, &mut breakpoints, &mut state)?;
                 if let Some((event_id, _)) = emitted_allocator_event {
@@ -1713,10 +2327,23 @@ where
                                 )?;
                             } else {
                                 pending_step_command_id.take();
+                                if let Some(pending) = pending_nexti.take() {
+                                    breakpoints.remove_user_step_over_breakpoint(
+                                        child,
+                                        pending.breakpoint_addr,
+                                    )?;
+                                    on_control_status(
+                                        Some(pending.command_id),
+                                        Some(LiveCommand::StepInstructionOver),
+                                        LiveCommandStatus::Failed,
+                                        target_status,
+                                        format!("nexti interrupted: break condition matched after event #{event_id}"),
+                                    )?;
+                                }
                             }
                         }
                     }
-                    handle_live_trace_controls(
+                    if handle_live_trace_controls(
                         child,
                         &mut poll_control,
                         &mut on_control_status,
@@ -1726,8 +2353,16 @@ where
                         &mut target_status,
                         &mut pending_pause_command_id,
                         &mut pending_step_command_id,
+                        &mut pending_nexti,
                         &mut stop_requested_at,
-                    )?;
+                        &mut breakpoints,
+                        &mut on_register_snapshot,
+                    )? == LiveControlOutcome::TargetExited
+                    {
+                        print_missing_libc_metadata_at_trace_end(&mut state);
+                        finish_stdin_writer(stdin_writer.take())?;
+                        return Ok(());
+                    }
                 }
                 if !paused {
                     ptrace::cont(child, None)
@@ -1772,8 +2407,35 @@ where
                         target_status,
                     )?;
                 } else {
-                    ptrace::cont(child, signal_to_deliver(signal))
-                        .with_context(|| format!("failed to continue child after {signal:?}"))?;
+                    if let Some(pending) = pending_nexti.take() {
+                        breakpoints
+                            .remove_user_step_over_breakpoint(child, pending.breakpoint_addr)?;
+                        paused = true;
+                        target_status = LiveTargetStatus::Paused;
+                        emit_register_snapshot_best_effort(
+                            child,
+                            None,
+                            &mut on_register_snapshot,
+                            &mut on_control_status,
+                            target_status,
+                        )?;
+                        on_control_status(
+                            Some(pending.command_id),
+                            Some(LiveCommand::StepInstructionOver),
+                            LiveCommandStatus::Failed,
+                            target_status,
+                            format_instruction_step_signal(
+                                signal,
+                                read_register_snapshot(child)
+                                    .ok()
+                                    .map(|snapshot| snapshot.instruction_pointer),
+                            ),
+                        )?;
+                    } else {
+                        ptrace::cont(child, signal_to_deliver(signal)).with_context(|| {
+                            format!("failed to continue child after {signal:?}")
+                        })?;
+                    }
                 }
             }
             WaitStatus::PtraceEvent(pid, signal, _) if pid == child => {
@@ -1789,7 +2451,7 @@ where
     }
 }
 
-fn handle_live_trace_controls<C, T>(
+fn handle_live_trace_controls<C, T, R>(
     child: Pid,
     poll_control: &mut C,
     on_control_status: &mut T,
@@ -1799,8 +2461,11 @@ fn handle_live_trace_controls<C, T>(
     target_status: &mut LiveTargetStatus,
     pending_pause_command_id: &mut Option<LiveCommandId>,
     pending_step_command_id: &mut Option<LiveCommandId>,
+    pending_nexti: &mut Option<PendingInstructionStepOver>,
     stop_requested_at: &mut Option<Instant>,
-) -> Result<()>
+    breakpoints: &mut BreakpointManager,
+    on_register_snapshot: &mut R,
+) -> Result<LiveControlOutcome>
 where
     C: FnMut() -> Option<LiveCommandMessage>,
     T: FnMut(
@@ -1810,6 +2475,7 @@ where
         LiveTargetStatus,
         String,
     ) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
 {
     while let Some(message) = poll_control() {
         let command = message.command;
@@ -1829,6 +2495,10 @@ where
                 *run_mode = LiveTraceRunMode::Continuous;
                 *pending_pause_command_id = None;
                 *pending_step_command_id = None;
+                if let Some(pending) = pending_nexti.take() {
+                    let _ = breakpoints
+                        .remove_user_step_over_breakpoint(child, pending.breakpoint_addr);
+                }
                 on_control_status(
                     Some(message.id),
                     Some(command),
@@ -1905,6 +2575,10 @@ where
             }
             LiveCommand::Continue => {
                 *run_mode = LiveTraceRunMode::Continuous;
+                if let Some(pending) = pending_nexti.take() {
+                    let _ = breakpoints
+                        .remove_user_step_over_breakpoint(child, pending.breakpoint_addr);
+                }
                 on_control_status(
                     Some(message.id),
                     Some(command),
@@ -1978,14 +2652,360 @@ where
                     }
                 }
             }
+            LiveCommand::StepInstruction => {
+                let pause_state = LiveWorkerPauseState {
+                    ptrace_stopped: *paused,
+                    user_visible_paused: *target_status == LiveTargetStatus::Paused,
+                    step_in_flight: None,
+                    temporary_return_breakpoint_in_flight: breakpoints
+                        .has_temporary_return_breakpoints(),
+                    managed_breakpoints_rearmed: breakpoints.all_breakpoints_rearmed(),
+                };
+                if let Err(reason) = pause_state.can_user_step_instruction() {
+                    on_control_status(
+                        Some(message.id),
+                        Some(command),
+                        LiveCommandStatus::Rejected,
+                        *target_status,
+                        reason,
+                    )?;
+                    continue;
+                }
+
+                let before_rip = read_register_snapshot(child)
+                    .ok()
+                    .map(|snapshot| snapshot.instruction_pointer);
+                *target_status = LiveTargetStatus::SteppingInstruction;
+                on_control_status(
+                    Some(message.id),
+                    Some(command),
+                    LiveCommandStatus::Accepted,
+                    *target_status,
+                    match before_rip {
+                        Some(rip) => format!("stepping instruction at RIP=0x{rip:x}"),
+                        None => "stepping instruction at RIP=unknown".to_string(),
+                    },
+                )?;
+
+                let step_kind = StepKind::UserInstructionStep;
+                debug_assert_eq!(step_kind, StepKind::UserInstructionStep);
+                match ptrace::step(child, None) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        *target_status = LiveTargetStatus::Paused;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format!("instruction step failed: {err}"),
+                        )?;
+                        continue;
+                    }
+                }
+
+                match waitpid(child, None).context("failed waiting for instruction step stop")? {
+                    WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {
+                        *paused = true;
+                        *target_status = LiveTargetStatus::Paused;
+                        let after_rip = emit_register_snapshot_best_effort(
+                            child,
+                            None,
+                            on_register_snapshot,
+                            on_control_status,
+                            *target_status,
+                        )
+                        .ok()
+                        .and_then(|_| read_register_snapshot(child).ok())
+                        .map(|snapshot| snapshot.instruction_pointer);
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Completed,
+                            *target_status,
+                            format_instruction_step_completed(before_rip, after_rip),
+                        )?;
+                    }
+                    WaitStatus::Stopped(pid, signal) if pid == child => {
+                        *paused = true;
+                        *target_status = LiveTargetStatus::Paused;
+                        let after_rip = emit_register_snapshot_best_effort(
+                            child,
+                            None,
+                            on_register_snapshot,
+                            on_control_status,
+                            *target_status,
+                        )
+                        .ok()
+                        .and_then(|_| read_register_snapshot(child).ok())
+                        .map(|snapshot| snapshot.instruction_pointer);
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format_instruction_step_signal(signal, after_rip),
+                        )?;
+                    }
+                    WaitStatus::Exited(pid, code) if pid == child => {
+                        *paused = false;
+                        *target_status = LiveTargetStatus::Exited;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Completed,
+                            *target_status,
+                            format!("target exited with status {code}"),
+                        )?;
+                        return Ok(LiveControlOutcome::TargetExited);
+                    }
+                    WaitStatus::Signaled(pid, signal, _) if pid == child => {
+                        *paused = false;
+                        *target_status = LiveTargetStatus::Exited;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Completed,
+                            *target_status,
+                            format!("target terminated by signal {signal:?}"),
+                        )?;
+                        return Ok(LiveControlOutcome::TargetExited);
+                    }
+                    status => {
+                        *paused = true;
+                        *target_status = LiveTargetStatus::Paused;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format!("instruction step stopped unexpectedly: {status:?}"),
+                        )?;
+                    }
+                }
+            }
+            LiveCommand::StepInstructionOver => {
+                let pause_state = LiveWorkerPauseState {
+                    ptrace_stopped: *paused,
+                    user_visible_paused: *target_status == LiveTargetStatus::Paused,
+                    step_in_flight: None,
+                    temporary_return_breakpoint_in_flight: breakpoints
+                        .has_temporary_return_breakpoints(),
+                    managed_breakpoints_rearmed: breakpoints.all_breakpoints_rearmed(),
+                };
+                if let Err(reason) = pause_state.can_user_step_instruction() {
+                    on_control_status(
+                        Some(message.id),
+                        Some(command),
+                        LiveCommandStatus::Rejected,
+                        *target_status,
+                        reason,
+                    )?;
+                    continue;
+                }
+
+                let before_snapshot = match read_register_snapshot(child) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format!("nexti failed: {err}"),
+                        )?;
+                        continue;
+                    }
+                };
+                let before_rip = before_snapshot.instruction_pointer;
+                let decoded = match decode_instruction_at_rip(child, before_rip) {
+                    Ok(decoded) => decoded,
+                    Err(err) => {
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format!("nexti decode failed at RIP=0x{before_rip:x}: {err}"),
+                        )?;
+                        continue;
+                    }
+                };
+                let fallthrough = decoded_instruction_fallthrough(&decoded);
+
+                if decoded.is_call {
+                    match breakpoints.set_user_step_over_breakpoint(
+                        child,
+                        fallthrough,
+                        message.id,
+                        before_rip,
+                    ) {
+                        Ok(()) => {}
+                        Err(err) => {
+                            on_control_status(
+                                Some(message.id),
+                                Some(command),
+                                LiveCommandStatus::Failed,
+                                *target_status,
+                                format!("nexti failed: {err}"),
+                            )?;
+                            continue;
+                        }
+                    }
+                    match ptrace::cont(child, None) {
+                        Ok(()) => {
+                            *paused = false;
+                            *pause_requested = false;
+                            *run_mode = LiveTraceRunMode::UserInstructionStepOver;
+                            *target_status = LiveTargetStatus::SteppingInstructionOver;
+                            *pending_nexti = Some(PendingInstructionStepOver {
+                                command_id: message.id,
+                                from_rip: before_rip,
+                                breakpoint_addr: fallthrough,
+                            });
+                            on_control_status(
+                                Some(message.id),
+                                Some(command),
+                                LiveCommandStatus::Accepted,
+                                *target_status,
+                                format!(
+                                    "stepping over call from 0x{before_rip:x} to 0x{fallthrough:x}"
+                                ),
+                            )?;
+                        }
+                        Err(err) => {
+                            let _ =
+                                breakpoints.remove_user_step_over_breakpoint(child, fallthrough);
+                            *target_status = LiveTargetStatus::Paused;
+                            on_control_status(
+                                Some(message.id),
+                                Some(command),
+                                LiveCommandStatus::Failed,
+                                *target_status,
+                                format!("nexti failed: {err}"),
+                            )?;
+                        }
+                    }
+                    continue;
+                }
+
+                *target_status = LiveTargetStatus::SteppingInstructionOver;
+                on_control_status(
+                    Some(message.id),
+                    Some(command),
+                    LiveCommandStatus::Accepted,
+                    *target_status,
+                    format!("nexti non-call single-step at RIP=0x{before_rip:x}"),
+                )?;
+                let step_kind = StepKind::UserInstructionStepOver;
+                debug_assert_eq!(step_kind, StepKind::UserInstructionStepOver);
+                match ptrace::step(child, None) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        *target_status = LiveTargetStatus::Paused;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format!("nexti failed: {err}"),
+                        )?;
+                        continue;
+                    }
+                }
+                match waitpid(child, None).context("failed waiting for nexti single-step stop")? {
+                    WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {
+                        *paused = true;
+                        *target_status = LiveTargetStatus::Paused;
+                        let after_rip = read_register_snapshot(child)
+                            .ok()
+                            .map(|snapshot| snapshot.instruction_pointer);
+                        emit_register_snapshot_best_effort(
+                            child,
+                            None,
+                            on_register_snapshot,
+                            on_control_status,
+                            *target_status,
+                        )?;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Completed,
+                            *target_status,
+                            format_instruction_step_over_completed(Some(before_rip), after_rip),
+                        )?;
+                    }
+                    WaitStatus::Stopped(pid, signal) if pid == child => {
+                        *paused = true;
+                        *target_status = LiveTargetStatus::Paused;
+                        emit_register_snapshot_best_effort(
+                            child,
+                            None,
+                            on_register_snapshot,
+                            on_control_status,
+                            *target_status,
+                        )?;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format_instruction_step_signal(
+                                signal,
+                                read_register_snapshot(child)
+                                    .ok()
+                                    .map(|snapshot| snapshot.instruction_pointer),
+                            ),
+                        )?;
+                    }
+                    WaitStatus::Exited(pid, code) if pid == child => {
+                        *paused = false;
+                        *target_status = LiveTargetStatus::Exited;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Completed,
+                            *target_status,
+                            format!("target exited with status {code}"),
+                        )?;
+                        return Ok(LiveControlOutcome::TargetExited);
+                    }
+                    WaitStatus::Signaled(pid, signal, _) if pid == child => {
+                        *paused = false;
+                        *target_status = LiveTargetStatus::Exited;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Completed,
+                            *target_status,
+                            format!("target terminated by signal {signal:?}"),
+                        )?;
+                        return Ok(LiveControlOutcome::TargetExited);
+                    }
+                    status => {
+                        *paused = true;
+                        *target_status = LiveTargetStatus::Paused;
+                        on_control_status(
+                            Some(message.id),
+                            Some(command),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format!("nexti stopped unexpectedly: {status:?}"),
+                        )?;
+                    }
+                }
+            }
         }
     }
 
-    Ok(())
+    Ok(LiveControlOutcome::Continue)
 }
 
 fn should_continue_after_allocator_event(run_mode: LiveTraceRunMode) -> bool {
-    run_mode == LiveTraceRunMode::Continuous
+    matches!(
+        run_mode,
+        LiveTraceRunMode::Continuous | LiveTraceRunMode::UserInstructionStepOver
+    )
 }
 
 fn should_pause_after_allocator_event(
@@ -2008,7 +3028,7 @@ fn emit_register_snapshot_best_effort<R, T>(
     target_status: LiveTargetStatus,
 ) -> Result<()>
 where
-    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot) -> Result<()>,
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
     T: FnMut(
         Option<LiveCommandId>,
         Option<LiveCommand>,
@@ -2021,7 +3041,7 @@ where
         Ok(snapshot) => {
             let stack_snapshot =
                 read_stack_snapshot(child, snapshot.stack_pointer, DEFAULT_STACK_SNAPSHOT_WORDS);
-            on_register_snapshot(event_id, snapshot, stack_snapshot)
+            on_register_snapshot(event_id, snapshot, stack_snapshot, child)
         }
         Err(err) => on_control_status(
             None,
@@ -2030,6 +3050,36 @@ where
             target_status,
             format!("register snapshot failed: {err}"),
         ),
+    }
+}
+
+fn format_instruction_step_completed(before_rip: Option<u64>, after_rip: Option<u64>) -> String {
+    match (before_rip, after_rip) {
+        (Some(before), Some(after)) => {
+            format!("stepped instruction: 0x{before:x} -> 0x{after:x}")
+        }
+        (Some(before), None) => format!("stepped instruction: 0x{before:x} -> unknown"),
+        (None, Some(after)) => format!("stepped instruction: unknown -> 0x{after:x}"),
+        (None, None) => "stepped instruction".to_string(),
+    }
+}
+
+fn format_instruction_step_over_completed(
+    before_rip: Option<u64>,
+    after_rip: Option<u64>,
+) -> String {
+    match (before_rip, after_rip) {
+        (Some(before), Some(after)) => format!("nexti completed: 0x{before:x} -> 0x{after:x}"),
+        (Some(before), None) => format!("nexti completed: 0x{before:x} -> unknown"),
+        (None, Some(after)) => format!("nexti completed: unknown -> 0x{after:x}"),
+        (None, None) => "nexti completed".to_string(),
+    }
+}
+
+fn format_instruction_step_signal(signal: Signal, rip: Option<u64>) -> String {
+    match rip {
+        Some(rip) => format!("instruction step stopped by {signal:?} at RIP=0x{rip:x}"),
+        None => format!("instruction step stopped by {signal:?} at RIP=unknown"),
     }
 }
 
@@ -2282,16 +3332,18 @@ where
     regs.rip = hit_addr;
     ptrace::setregs(child, regs).context("failed to restore RIP after breakpoint")?;
 
-    let mut managed = manager
-        .remove(hit_addr)
-        .with_context(|| format!("missing managed breakpoint at 0x{hit_addr:x}"))?;
-    managed
+    let breakpoint_kind = manager
+        .allocator_owner(hit_addr)
+        .with_context(|| format!("missing allocator breakpoint owner at 0x{hit_addr:x}"))?;
+    manager
+        .get_mut(hit_addr)
+        .with_context(|| format!("missing managed breakpoint at 0x{hit_addr:x}"))?
         .breakpoint
         .disable(child)
         .with_context(|| format!("failed to disable breakpoint at 0x{hit_addr:x}"))?;
 
     let mut emitted_allocator_event = None;
-    let remove_after_step = match managed.kind.clone() {
+    let remove_after_step = match breakpoint_kind.clone() {
         BreakpointKind::MallocEntry => {
             let event_id = state.next_event_id();
             let requested_size = regs.rdi;
@@ -2460,21 +3512,89 @@ where
         }
     };
 
+    let step_kind = StepKind::InternalBreakpointStepOver;
+    debug_assert_eq!(step_kind, StepKind::InternalBreakpointStepOver);
     ptrace::step(child, None).context("failed to single-step child")?;
     match waitpid(child, None).context("failed waiting for single-step stop")? {
         WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {}
         status => bail!("expected SIGTRAP after single-step, got {status:?}"),
     }
 
-    if !remove_after_step {
+    if remove_after_step {
+        manager.remove_owner_at(child, hit_addr, |owner| {
+            matches!(owner, BreakpointOwner::Allocator(kind) if breakpoint_kind_matches(kind, &breakpoint_kind))
+        })?;
+    }
+    if let Some(managed) = manager.get_mut(hit_addr) {
         managed
             .breakpoint
             .enable(child)
             .with_context(|| format!("failed to re-enable breakpoint at 0x{hit_addr:x}"))?;
-        manager.insert_managed(managed);
     }
 
     Ok(emitted_allocator_event)
+}
+
+fn breakpoint_kind_matches(left: &BreakpointKind, right: &BreakpointKind) -> bool {
+    std::mem::discriminant(left) == std::mem::discriminant(right)
+}
+
+fn handle_user_step_over_breakpoint_hit<R, T>(
+    child: Pid,
+    manager: &mut BreakpointManager,
+    pending: PendingInstructionStepOver,
+    on_register_snapshot: &mut R,
+    on_control_status: &mut T,
+) -> Result<()>
+where
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    T: FnMut(
+        Option<LiveCommandId>,
+        Option<LiveCommand>,
+        LiveCommandStatus,
+        LiveTargetStatus,
+        String,
+    ) -> Result<()>,
+{
+    let mut regs = ptrace::getregs(child).context("failed to read child registers")?;
+    let hit_addr = regs.rip.saturating_sub(1);
+    if hit_addr != pending.breakpoint_addr {
+        bail!(
+            "unexpected nexti SIGTRAP at rip=0x{:x} (hit address 0x{:x}, expected 0x{:x})",
+            regs.rip,
+            hit_addr,
+            pending.breakpoint_addr
+        );
+    }
+
+    regs.rip = hit_addr;
+    ptrace::setregs(child, regs).context("failed to restore RIP after nexti breakpoint")?;
+
+    manager.remove_user_step_over_breakpoint(child, hit_addr)?;
+    if let Some(managed) = manager.get_mut(hit_addr) {
+        managed
+            .breakpoint
+            .enable(child)
+            .with_context(|| format!("failed to re-enable breakpoint at 0x{hit_addr:x}"))?;
+    }
+
+    let after_rip = read_register_snapshot(child)
+        .ok()
+        .map(|snapshot| snapshot.instruction_pointer);
+    emit_register_snapshot_best_effort(
+        child,
+        None,
+        on_register_snapshot,
+        on_control_status,
+        LiveTargetStatus::Paused,
+    )?;
+    on_control_status(
+        Some(pending.command_id),
+        Some(LiveCommand::StepInstructionOver),
+        LiveCommandStatus::Completed,
+        LiveTargetStatus::Paused,
+        format_instruction_step_over_completed(Some(pending.from_rip), after_rip),
+    )
 }
 
 fn handle_breakpoint_hit(child: Pid, breakpoint: &mut Breakpoint) -> Result<()> {
@@ -2515,6 +3635,22 @@ pub fn read_word(pid: Pid, addr: u64) -> Result<u64> {
     let word = ptrace::read(pid, addr as ptrace::AddressType)
         .with_context(|| format!("failed to read word at 0x{addr:x}"))?;
     Ok(word as u64)
+}
+
+fn read_process_memory(pid: Pid, address: u64, size: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(size);
+    let mut offset = 0usize;
+    while offset < size {
+        let addr = address
+            .checked_add(offset as u64)
+            .context("process memory address overflow")?;
+        let word = read_word(pid, addr)?;
+        let word_bytes = word.to_le_bytes();
+        let len = (size - offset).min(word_bytes.len());
+        bytes.extend_from_slice(&word_bytes[..len]);
+        offset += len;
+    }
+    Ok(bytes)
 }
 
 fn capture_caller_addr(pid: Pid, rsp: u64) -> Option<u64> {
@@ -4713,16 +5849,21 @@ mod tests {
         classify_fastbin_pointer_candidate, classify_main_arena_pointer_candidate,
         classify_main_arena_top_candidate, classify_regular_bin_head,
         classify_unsorted_bin_pointer_candidate, classify_unsorted_bin_snapshot,
+        decode_x86_64_instruction, decoded_instruction_fallthrough,
         detect_glibc_version_from_bytes, extract_u16_from_word_le, fastbin_candidate_user_addr,
         fastbin_chain_next_is_plausible, fastbin_experiment_scan_offsets, fastbin_head_user_addr,
         libc_symbol_file, paths_same_best_effort, print_missing_libc_metadata_at_trace_end,
-        read_fastbin_chain, register_snapshot_from_x86_64_regs, regular_bin_snapshot_limit,
+        read_disassembly_snapshot_with_reader, read_fastbin_chain,
+        register_snapshot_from_x86_64_regs, regular_bin_snapshot_limit,
         return_address_source_lookup_addr, runtime_addr_to_source_relative_addr,
         runtime_objects_from_mappings, runtime_symbol_addr, should_continue_after_allocator_event,
         should_pause_after_allocator_event, suggested_glibc_profile_hint_lines, write_all_to_fd,
-        AllocationTraceMode, AllocatorEventControl, LaunchConfig, LaunchMode, LibcMetadata,
-        LiveTraceRunMode, MemoryMapping, ProcessSymbolizer, RegisterArch, RegisterRole,
-        RuntimeSymbol, StdinConfig, TargetSymbolizer, TraceHeapState,
+        AllocationTraceMode, AllocatorEventControl, Breakpoint, BreakpointManager, BreakpointOwner,
+        BreakpointPurpose, DebuggerStopReason, DisassemblyFlowControl, LaunchConfig, LaunchMode,
+        LibcMetadata, LiveCommand, LiveCommandId, LiveTargetStatus, LiveTraceRunMode,
+        LiveWorkerPauseState, ManagedBreakpoint, MemoryMapping, ProcessSymbolizer, RegisterArch,
+        RegisterRole, RuntimeSymbol, StdinConfig, StepKind, TargetMemoryReader, TargetSymbolizer,
+        TraceHeapState,
     };
     use heapify_core::glibc::{
         BinExperimentRole, GlibcChunkHeader, GlibcHeapSnapshot, MainArenaRoleHint,
@@ -4732,6 +5873,27 @@ mod tests {
     use heapify_core::tracker::HeapTracker;
     use nix::unistd::Pid;
     use std::path::{Path, PathBuf};
+
+    struct SliceMemoryReader {
+        base: u64,
+        bytes: Vec<u8>,
+    }
+
+    impl TargetMemoryReader for SliceMemoryReader {
+        fn read_memory(&self, address: u64, size: usize) -> anyhow::Result<Vec<u8>> {
+            let offset = address
+                .checked_sub(self.base)
+                .ok_or_else(|| anyhow::anyhow!("address before test buffer"))?
+                as usize;
+            let end = offset
+                .checked_add(size)
+                .ok_or_else(|| anyhow::anyhow!("test read overflow"))?;
+            if end > self.bytes.len() {
+                anyhow::bail!("test read beyond buffer");
+            }
+            Ok(self.bytes[offset..end].to_vec())
+        }
+    }
 
     #[test]
     fn register_snapshot_get_and_summary_line_use_named_registers() {
@@ -4857,6 +6019,9 @@ mod tests {
         assert!(should_continue_after_allocator_event(
             LiveTraceRunMode::Continuous
         ));
+        assert!(should_continue_after_allocator_event(
+            LiveTraceRunMode::UserInstructionStepOver
+        ));
         assert!(!should_continue_after_allocator_event(
             LiveTraceRunMode::StepAllocatorEvent
         ));
@@ -4880,6 +6045,310 @@ mod tests {
             LiveTraceRunMode::Continuous,
             AllocatorEventControl::Continue
         ));
+    }
+
+    #[test]
+    fn validate_live_command_allows_step_instruction_only_while_paused() {
+        assert!(super::validate_live_command(
+            LiveTargetStatus::Paused,
+            LiveCommand::StepInstruction
+        )
+        .is_ok());
+        for status in [
+            LiveTargetStatus::NotStarted,
+            LiveTargetStatus::Running,
+            LiveTargetStatus::SteppingToNextAllocatorEvent,
+            LiveTargetStatus::SteppingInstruction,
+            LiveTargetStatus::Stopping,
+            LiveTargetStatus::Exited,
+        ] {
+            assert!(super::validate_live_command(status, LiveCommand::StepInstruction).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_live_command_allows_step_instruction_over_only_while_paused() {
+        assert!(super::validate_live_command(
+            LiveTargetStatus::Paused,
+            LiveCommand::StepInstructionOver
+        )
+        .is_ok());
+        for status in [
+            LiveTargetStatus::NotStarted,
+            LiveTargetStatus::Running,
+            LiveTargetStatus::SteppingToNextAllocatorEvent,
+            LiveTargetStatus::SteppingInstruction,
+            LiveTargetStatus::SteppingInstructionOver,
+            LiveTargetStatus::Stopping,
+            LiveTargetStatus::Exited,
+        ] {
+            assert!(
+                super::validate_live_command(status, LiveCommand::StepInstructionOver).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn stable_pause_guard_rejects_internal_breakpoint_step_over() {
+        let state = LiveWorkerPauseState {
+            step_in_flight: Some(StepKind::InternalBreakpointStepOver),
+            ..LiveWorkerPauseState::stable_user_pause()
+        };
+
+        let err = state.can_user_step_instruction().unwrap_err();
+
+        assert_eq!(
+            err,
+            "cannot step instruction while Heapify is resolving an internal breakpoint"
+        );
+    }
+
+    #[test]
+    fn stable_pause_guard_requires_rearmed_breakpoints_and_no_return_breakpoint() {
+        let disabled_breakpoint_state = LiveWorkerPauseState {
+            managed_breakpoints_rearmed: false,
+            ..LiveWorkerPauseState::stable_user_pause()
+        };
+        let temporary_return_state = LiveWorkerPauseState {
+            temporary_return_breakpoint_in_flight: true,
+            ..LiveWorkerPauseState::stable_user_pause()
+        };
+
+        assert!(disabled_breakpoint_state
+            .can_user_step_instruction()
+            .is_err());
+        assert!(temporary_return_state.can_user_step_instruction().is_err());
+        assert!(LiveWorkerPauseState::stable_user_pause()
+            .can_user_step_instruction()
+            .is_ok());
+    }
+
+    #[test]
+    fn user_instruction_step_kind_is_distinct_from_internal_step_over() {
+        assert_ne!(
+            StepKind::UserInstructionStep,
+            StepKind::InternalBreakpointStepOver
+        );
+        assert_ne!(
+            StepKind::UserInstructionStepOver,
+            StepKind::InternalBreakpointStepOver
+        );
+    }
+
+    #[test]
+    fn debugger_stop_reason_summary_lines_are_stable() {
+        assert_eq!(
+            DebuggerStopReason::InstructionStepOver {
+                from_rip: 0x401000,
+                to_rip: 0x401005
+            }
+            .summary_line(),
+            "nexti completed: 0x401000 -> 0x401005"
+        );
+        assert_eq!(
+            DebuggerStopReason::AllocatorEventStep { event_id: 7 }.summary_line(),
+            "paused after allocator event #7"
+        );
+    }
+
+    #[test]
+    fn direct_call_instruction_decoding_computes_fallthrough() {
+        let decoded = decode_x86_64_instruction(0x401000, &[0xe8, 0x01, 0x00, 0x00, 0x00]).unwrap();
+
+        assert!(decoded.is_call);
+        assert_eq!(decoded.length, 5);
+        assert_eq!(decoded_instruction_fallthrough(&decoded), 0x401005);
+    }
+
+    #[test]
+    fn disassembly_snapshot_extracts_direct_call_target() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: [&[0xe8, 0x01, 0x00, 0x00, 0x00][..], &[0x90; 32][..]].concat(),
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401000, 0, 16, 4);
+
+        let current = snapshot.lines.iter().find(|line| line.is_current).unwrap();
+        assert_eq!(current.bytes, vec![0xe8, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(current.mnemonic, "call");
+        assert_eq!(current.target, Some(0x401006));
+        assert_eq!(current.flow_control, Some(DisassemblyFlowControl::Call));
+    }
+
+    #[test]
+    fn disassembly_snapshot_extracts_conditional_branch_target() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: [&[0x75, 0x05][..], &[0x90; 32][..]].concat(),
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401000, 0, 16, 4);
+
+        let current = snapshot.lines.iter().find(|line| line.is_current).unwrap();
+        assert_eq!(current.mnemonic, "jne");
+        assert_eq!(current.target, Some(0x401007));
+        assert_eq!(
+            current.flow_control,
+            Some(DisassemblyFlowControl::ConditionalBranch)
+        );
+    }
+
+    #[test]
+    fn disassembly_snapshot_leaves_indirect_call_target_unknown() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: [&[0xff, 0xd0][..], &[0x90; 32][..]].concat(),
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401000, 0, 16, 4);
+
+        let current = snapshot.lines.iter().find(|line| line.is_current).unwrap();
+        assert_eq!(current.mnemonic, "call");
+        assert_eq!(current.target, None);
+        assert_eq!(current.flow_control, Some(DisassemblyFlowControl::Call));
+    }
+
+    #[test]
+    fn disassembly_snapshot_marks_current_rip_line() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: [&[0x55, 0x48, 0x89, 0xe5, 0x90][..], &[0x90; 32][..]].concat(),
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401004, 4, 16, 8);
+
+        assert!(snapshot
+            .lines
+            .iter()
+            .any(|line| { line.address == 0x401004 && line.is_current && line.mnemonic == "nop" }));
+        assert!(snapshot.lines.iter().any(|line| line.address == 0x401000));
+        assert!(snapshot.lines.iter().any(|line| line.address == 0x401001));
+    }
+
+    #[test]
+    fn disassembly_snapshot_handles_truncated_memory_without_panic() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: vec![0x0f],
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401000, 0, 8, 4);
+
+        assert!(snapshot.lines.is_empty());
+        assert!(snapshot.read_error.is_some());
+        assert!(snapshot.truncated_before || snapshot.truncated_after);
+    }
+
+    #[test]
+    fn disassembly_snapshot_forward_decodes_from_rip() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: [&[0x90, 0x90, 0xc3][..], &[0x90; 32][..]].concat(),
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401000, 0, 8, 3);
+
+        assert_eq!(
+            snapshot
+                .lines
+                .iter()
+                .map(|line| line.mnemonic.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nop", "nop", "ret"]
+        );
+    }
+
+    #[test]
+    fn disassembly_snapshot_recovers_preceding_instructions_that_land_on_rip() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: [&[0x55, 0x48, 0x89, 0xe5, 0x90][..], &[0x90; 32][..]].concat(),
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401004, 4, 8, 8);
+
+        assert_eq!(snapshot.lines[0].address, 0x401000);
+        assert_eq!(snapshot.lines[1].address, 0x401001);
+        assert!(snapshot.lines.iter().any(|line| line.address == 0x401004));
+    }
+
+    #[test]
+    fn disassembly_snapshot_omits_uncertain_preceding_boundaries() {
+        let reader = SliceMemoryReader {
+            base: 0x401000,
+            bytes: [&[0xff, 0xff, 0x90][..], &[0x90; 32][..]].concat(),
+        };
+
+        let snapshot = read_disassembly_snapshot_with_reader(&reader, 0x401002, 2, 8, 6);
+
+        assert!(snapshot.lines.iter().all(|line| line.address >= 0x401002));
+        assert!(snapshot.truncated_before);
+    }
+
+    #[test]
+    fn breakpoint_owner_reports_purpose() {
+        assert_eq!(
+            BreakpointOwner::Allocator(super::BreakpointKind::MallocEntry).purpose(),
+            BreakpointPurpose::ManagedAllocatorEntry
+        );
+        assert_eq!(
+            BreakpointOwner::UserInstructionStepOver {
+                command_id: LiveCommandId(1),
+                from_rip: 0x401000,
+            }
+            .purpose(),
+            BreakpointPurpose::UserInstructionStepOver
+        );
+    }
+
+    #[test]
+    fn breakpoint_ownership_removal_preserves_other_owner_at_same_address() {
+        let mut manager = BreakpointManager::default();
+        manager.breakpoints.insert(
+            0x401005,
+            ManagedBreakpoint {
+                breakpoint: Breakpoint {
+                    addr: 0x401005,
+                    original_byte: 0x90,
+                    enabled: true,
+                },
+                owners: vec![
+                    BreakpointOwner::Allocator(super::BreakpointKind::MallocEntry),
+                    BreakpointOwner::UserInstructionStepOver {
+                        command_id: LiveCommandId(7),
+                        from_rip: 0x401000,
+                    },
+                ],
+            },
+        );
+
+        manager
+            .remove_user_step_over_breakpoint(Pid::from_raw(999999), 0x401005)
+            .unwrap();
+
+        let managed = manager.breakpoints.get(&0x401005).unwrap();
+        assert_eq!(managed.owners.len(), 1);
+        assert!(matches!(
+            managed.owners[0],
+            BreakpointOwner::Allocator(super::BreakpointKind::MallocEntry)
+        ));
+        assert!(managed.breakpoint.enabled);
+    }
+
+    #[test]
+    fn instruction_step_status_messages_include_rip_and_signal() {
+        assert_eq!(
+            super::format_instruction_step_completed(Some(0x401000), Some(0x401001)),
+            "stepped instruction: 0x401000 -> 0x401001"
+        );
+        assert_eq!(
+            super::format_instruction_step_signal(
+                nix::sys::signal::Signal::SIGSEGV,
+                Some(0x401000)
+            ),
+            "instruction step stopped by SIGSEGV at RIP=0x401000"
+        );
     }
 
     #[test]

@@ -110,17 +110,25 @@ Useful keys:
 - `p`: pause.
 - `r`: resume.
 - `n`: continue to the next allocator event and pause again.
+- `.`: step one machine instruction while paused.
+- `,`: step over one machine instruction while paused.
 - `c`: continue normally.
 - `Tab`: cycle focus.
 - `:`: open the command console.
 - `j`/`k` or arrows: move or scroll the focused pane.
+- `d`: recenter the code pane at RIP and resume follow-RIP mode.
 - `g`: jump in the heap pane.
 - `i`: toggle chunk inspector.
 - `h`: toggle heap pane.
 - `s`: toggle allocator/scan pane.
 
-The live TUI is read-only over target memory. `n` is allocator-event stepping,
-not instruction, source, or disassembly stepping.
+The live TUI is read-only over target memory. `n` is allocator-event stepping.
+`.` is Linux x86-64 ptrace-based machine-instruction stepping. `,` performs
+instruction step-over: calls run until their fall-through instruction, while
+non-call instructions behave like a single instruction step. Heapify may still
+record allocator events while `nexti` runs; heap break conditions can interrupt
+it. Source-level stepping, memory editing, and interactive breakpoint
+management are future work.
 
 The live TUI uses a debugger-style shell layout. The left column contains
 registers, code context, allocator trace, and a console/status pane. The right
@@ -131,17 +139,22 @@ inspector. The registers pane shows the latest register snapshot, marks changed
 registers after each stop/event, and adds best-effort address classifications
 for values that look like heap, stack, code, libc, loader, or mapped-file
 pointers. The code pane shows the current RIP, best-effort symbol/source/object
-context, and an explicit disassembly placeholder. The stack tab shows a
-read-only memory snapshot around RSP and uses the same best-effort address
-classification. The maps tab shows `/proc/<pid>/maps`-style memory mappings.
-Address classification is evidence for inspection, not proof that a value is a
-valid pointer.
+context, and a read-only x86-64 disassembly window around RIP. The current
+instruction is marked, raw bytes are shown, and direct branch/call targets are
+annotated from symbols when available. The stack tab shows a read-only memory
+snapshot around RSP and uses the same best-effort address classification. The
+maps tab shows `/proc/<pid>/maps`-style memory mappings. Address classification
+is evidence for inspection, not proof that a value is a valid pointer.
 
 The command console starts with a small command set that maps to existing live
-TUI actions: `help`, `continue`, `pause`, `resume`, `next`, `stop`, `regs`,
-`stack`, `maps`, `heap ADDR`, `jump ADDR`, and `tab NAME`. Expression
-evaluation, memory editing, register editing, and instruction stepping are not
-implemented.
+TUI actions: `help`, `continue`, `pause`, `resume`, `next`, `stepi`, `si`,
+`step`, `nexti`, `ni`, `disas`, `disassemble`, `stop`, `regs`, `stack`,
+`maps`, `heap ADDR`, `jump ADDR`, and `tab NAME`. `:stepi`, `:si`, and
+`:step` step one machine instruction while paused. `:nexti` and `:ni` step
+over calls. `:disas` and `:disassemble` focus the Code pane and recenter at
+RIP. `n`/`:next` remains allocator-event stepping. Expression evaluation,
+memory editing, register editing, source stepping, and a source-file viewer are
+not implemented.
 
 ## Allocator Views
 
