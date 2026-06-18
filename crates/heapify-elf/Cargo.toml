@@ -7,4 +7,4 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-object = { version = "0.36", default-features = false, features = ["read", "elf", "std"] }
+object.workspace = true

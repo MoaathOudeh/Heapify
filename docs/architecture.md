@@ -89,10 +89,6 @@ symbol metadata when available. `d` recenters the pane at RIP, and `:disas`
 focuses the Code pane and recenters. Source stepping, a source-file viewer,
 memory editing, and interactive breakpoint management remain future work.
 
-v0.81 adds live register snapshot plumbing for Linux x86-64 stops. Snapshots are
-captured as structured data and attached to live TUI state, but there is not yet
-a dedicated register pane or instruction stepping.
-
 ## JSON and Replay Flow
 
 When JSON output is enabled, `heapify-cli` serializes the same trace records
@@ -139,3 +135,23 @@ Allocator source membership is evidence, not definitive truth. Disagreement
 between sources can be caused by real corruption, missed events, target-specific
 allocator behavior, hardening, bad offsets, weak profile confidence, or false
 positive candidates.
+
+## Verification Matrix
+
+Use these groups to keep default turnaround fast while preserving ptrace
+coverage:
+
+| Group | Command | Scope |
+| --- | --- | --- |
+| Format | `cargo fmt --all --check` | Rust formatting |
+| Build/check | `cargo check --workspace` | All crates and default targets |
+| Lints | `cargo clippy --workspace --all-targets -- -D warnings` | Strict lint pass |
+| Fast unit tests | `cargo test --workspace --lib` | Pure library/module tests |
+| Full default tests | `cargo test --workspace` | Unit tests and non-ignored tests |
+| Examples | `./scripts/build-examples.sh` | Bundled C fixtures |
+| Smoke | `./scripts/smoke.sh` | Noninteractive CLI trace/replay checks |
+| Ptrace integration | `./scripts/test-integration.sh` or `cargo test --workspace -- --ignored` | Explicit Linux ptrace/process-spawning tests |
+
+CI should run the format, check, lint, fast unit, example build, and smoke
+groups by default. Ptrace integration tests should run on Linux x86-64 runners
+with ptrace enabled.

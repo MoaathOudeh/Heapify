@@ -274,11 +274,21 @@ The JSON trace format is alpha and not yet a stable public API. See
 - Allocator metadata is best-effort.
 - Profile-backed views depend on profile confidence.
 - No stack unwinding or backtrace yet.
-- No real disassembly, instruction stepping, or source stepping yet.
+- Source-level stepping is not implemented.
 - No memory editing.
 - No expression evaluator.
 - No watchpoints.
 - No non-glibc allocator support yet.
+
+## Current Debugger Capabilities
+
+Heapify currently supports allocator tracing, live pause/resume/continue,
+allocator-event stepping, `stepi`, `nexti`, read-only register/code/stack/maps
+snapshots, read-only disassembly around RIP, command-console control, break
+conditions on allocator diagnostics, NDJSON traces, and replay.
+
+Persistent user breakpoints, source stepping, stack unwinding/backtraces,
+watchpoints, memory editing, and expression evaluation remain future work.
 
 ## Development / Tests
 
@@ -287,10 +297,25 @@ Common checks:
 ```sh
 cargo fmt --all --check
 cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --lib
 cargo test --workspace
 ./scripts/build-examples.sh
 ./scripts/smoke.sh
 ```
+
+Fast local commands:
+
+```sh
+cargo check -p heapify-cli
+cargo test -p heapify-core
+cargo test -p heapify-debugger
+cargo test --workspace --lib
+cargo test --workspace -- --ignored
+```
+
+`cargo-nextest` is useful optional developer tooling for faster local test
+runs, but it is not required by the project.
 
 Project notes:
 
@@ -303,24 +328,25 @@ Project notes:
 v0.80 is the first usable alpha cleanup: documentation, CLI clarity, examples,
 smoke scripts, and project organization.
 
-v0.81 introduces register snapshot plumbing for live debugger stops. Full
-register panes and instruction stepping remain future work.
+v0.81 introduces register snapshot plumbing for live debugger stops.
 
 v0.82 and v0.83 add the live debugger shell layout and register pane. v0.84
 adds code-context plumbing and a code pane with RIP, symbol/source/object
-fields, and a disassembly placeholder. Real disassembly, source views, and
-instruction/source stepping remain future work.
+fields.
 
 v0.85 adds read-only stack snapshot plumbing and a stack tab around RSP, with
 best-effort heap/code pointer annotations. Stack unwinding, backtraces, memory
 editing, watchpoints, and general memory browsing remain future work.
 
 v0.86 adds a read-only maps tab and centralizes best-effort address
-classification for registers and stack values. Memory browsing/editing,
-watchpoints, and instruction stepping remain future work.
+classification for registers and stack values.
+
+v0.87 through v0.90 add allocator break conditions, live command-console
+control, `stepi`, `nexti`, read-only x86-64 disassembly around RIP, and
+register/code/stack refreshes after debugger stops.
 
 Near-term work is expected to focus on reliability of existing heap and
 allocator views, trace compatibility, diagnostics quality, and UI clarity. Full
-debugger features such as stack unwinding/backtraces, real disassembly/source
-stepping, watchpoints, memory editing, and expression evaluation are future
-work, not part of this milestone.
+debugger features such as persistent user breakpoints, source stepping, stack
+unwinding/backtraces, watchpoints, memory editing, and expression evaluation are
+future work, not part of this milestone.

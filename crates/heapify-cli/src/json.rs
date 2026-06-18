@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use heapify_core::allocator_sources::{
     allocator_source_kind_str, allocator_warning_kind_str, AllocatorSourceDelta,
     AllocatorSourceMembership, AllocatorSourceSummary, AllocatorWarning,
@@ -2356,9 +2358,8 @@ mod tests {
         assert_eq!(value["launch"]["stdin"]["kind"], "text");
         assert_eq!(value["launch"]["stdin"]["bytes"], 4);
         assert_eq!(value["allocator_views_preset"], "basic");
-        assert_eq!(
-            value.to_string().contains("/secret/bin"),
-            false,
+        assert!(
+            !value.to_string().contains("/secret/bin"),
             "launch metadata must not serialize environment values"
         );
         assert_eq!(value["features"]["layout"], true);
@@ -3148,7 +3149,7 @@ mod tests {
             HeapTrackerNote::NewAllocation,
             HeapTrackerExplanation::NoExtraExplanation,
         );
-        let before = serde_json::to_value(&record).unwrap();
+        let before = serde_json::to_value(record).unwrap();
 
         let decoded: JsonTraceRecord = serde_json::from_value(before.clone()).unwrap();
         let after = serde_json::to_value(decoded).unwrap();

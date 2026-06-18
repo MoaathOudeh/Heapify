@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 pub mod allocator_sources;
 pub mod glibc;
 pub mod heap_scan;
