@@ -127,13 +127,14 @@ The live TUI is read-only over target memory. `n` is allocator-event stepping.
 instruction step-over: calls run until their fall-through instruction, while
 non-call instructions behave like a single instruction step. Heapify may still
 record allocator events while `nexti` runs; heap break conditions can interrupt
-it. Source-level stepping, memory editing, and interactive breakpoint
-management are future work.
+it. Source-level stepping, memory editing, conditional breakpoints, watchpoints,
+and breakpoint command/actions are future work.
 
 The live TUI uses a debugger-style shell layout. The left column contains
 registers, code context, allocator trace, and a console/status pane. The right
-column has tabs for heap, stack, logs, and maps. Use `1`/`2`/`3`/`4` to switch
-right tabs, or `[` and `]` to move between them. The heap tab contains the
+column has tabs for heap, stack, logs, maps, and breakpoints. Use
+`1`/`2`/`3`/`4`/`5` to switch right tabs, or `[` and `]` to move between them.
+The heap tab contains the
 existing heap layout, allocator/scan summary, related records, and chunk
 inspector. The registers pane shows the latest register snapshot, marks changed
 registers after each stop/event, and adds best-effort address classifications
@@ -146,15 +147,31 @@ snapshot around RSP and uses the same best-effort address classification. The
 maps tab shows `/proc/<pid>/maps`-style memory mappings. Address classification
 is evidence for inspection, not proof that a value is a valid pointer.
 
+The breakpoints tab lists persistent user breakpoints with ID, enabled state,
+resolved address, best-effort symbol/source metadata, and hit count. With the
+breakpoints tab focused, `j`/`k` or arrows select rows, `Enter` inspects the
+selected breakpoint address in the Code pane, `Space` toggles enable/disable,
+and `x` deletes the selected breakpoint. The Code pane marks the current RIP
+with `>`, enabled breakpoint addresses with `B`, and the current instruction at
+an enabled breakpoint with `*>`. Press `d` to return the Code pane to RIP-follow
+mode.
+
 The command console starts with a small command set that maps to existing live
 TUI actions: `help`, `continue`, `pause`, `resume`, `next`, `stepi`, `si`,
-`step`, `nexti`, `ni`, `disas`, `disassemble`, `stop`, `regs`, `stack`,
-`maps`, `heap ADDR`, `jump ADDR`, and `tab NAME`. `:stepi`, `:si`, and
-`:step` step one machine instruction while paused. `:nexti` and `:ni` step
-over calls. `:disas` and `:disassemble` focus the Code pane and recenter at
-RIP. `n`/`:next` remains allocator-event stepping. Expression evaluation,
-memory editing, register editing, source stepping, and a source-file viewer are
-not implemented.
+`step`, `nexti`, `ni`, `break *ADDR`, `break SYMBOL`, `info breaks`,
+`disable ID`, `enable ID`, `delete ID`, `disas`, `disassemble`, `stop`,
+`regs`, `stack`, `maps`, `heap ADDR`, `jump ADDR`, and `tab NAME`. `:tab breaks`
+or `:tab breakpoints` opens the breakpoints tab. `:stepi`,
+`:si`, and `:step` step one machine instruction while paused. `:nexti` and
+`:ni` step over calls. `:break *0x4011a5` sets a persistent absolute-address
+breakpoint; `:break main` sets a persistent symbol breakpoint with PIE rebasing
+when applicable. Breakpoint add/delete/enable/disable commands require the
+target to be paused. `:info breaks` lists breakpoints, `:disable ID` and
+`:enable ID` toggle them, and `:delete ID` removes them. `:disas` and
+`:disassemble` focus the Code pane and recenter at RIP. `n`/`:next` remains
+allocator-event stepping. Source-line breakpoints, conditional breakpoints,
+watchpoints, breakpoint command/actions, expression evaluation, memory editing,
+register editing, source stepping, and a source-file viewer are not implemented.
 
 ## Allocator Views
 
@@ -278,6 +295,8 @@ The JSON trace format is alpha and not yet a stable public API. See
 - No memory editing.
 - No expression evaluator.
 - No watchpoints.
+- No source-line or conditional breakpoints.
+- No breakpoint command/actions.
 - No non-glibc allocator support yet.
 
 ## Current Debugger Capabilities
@@ -285,10 +304,12 @@ The JSON trace format is alpha and not yet a stable public API. See
 Heapify currently supports allocator tracing, live pause/resume/continue,
 allocator-event stepping, `stepi`, `nexti`, read-only register/code/stack/maps
 snapshots, read-only disassembly around RIP, command-console control, break
-conditions on allocator diagnostics, NDJSON traces, and replay.
+conditions on allocator diagnostics, persistent address and symbol breakpoints,
+NDJSON traces, and replay.
 
-Persistent user breakpoints, source stepping, stack unwinding/backtraces,
-watchpoints, memory editing, and expression evaluation remain future work.
+Source-line breakpoints, conditional breakpoints, breakpoint command/actions,
+source stepping, stack unwinding/backtraces, watchpoints, memory editing, and
+expression evaluation remain future work.
 
 ## Development / Tests
 
@@ -343,10 +364,14 @@ classification for registers and stack values.
 
 v0.87 through v0.90 add allocator break conditions, live command-console
 control, `stepi`, `nexti`, read-only x86-64 disassembly around RIP, and
-register/code/stack refreshes after debugger stops.
+register/code/stack refreshes after debugger stops. v0.91 adds persistent
+absolute-address and symbol breakpoints managed from the live console. v0.92
+adds a live Breakpoints tab with enable/disable/delete controls, breakpoint
+hit counts, code inspection, and breakpoint markers in disassembly.
 
 Near-term work is expected to focus on reliability of existing heap and
 allocator views, trace compatibility, diagnostics quality, and UI clarity. Full
-debugger features such as persistent user breakpoints, source stepping, stack
-unwinding/backtraces, watchpoints, memory editing, and expression evaluation are
-future work, not part of this milestone.
+debugger features such as source-line and conditional breakpoints, breakpoint
+command/actions, source stepping, stack unwinding/backtraces, watchpoints,
+memory editing, and expression evaluation are future work, not part of this
+milestone.

@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::UserBreakpointId;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveCommand {
     Stop,
     Pause,
@@ -7,10 +9,19 @@ pub enum LiveCommand {
     StepAllocatorEvent,
     StepInstruction,
     StepInstructionOver,
+    AddUserBreakpointAddress(u64),
+    AddUserBreakpointSymbol(String),
+    DeleteUserBreakpoint(UserBreakpointId),
+    EnableUserBreakpoint(UserBreakpointId),
+    DisableUserBreakpoint(UserBreakpointId),
+    InspectCodeAt {
+        address: u64,
+        breakpoint_id: Option<UserBreakpointId>,
+    },
 }
 
 impl LiveCommand {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             LiveCommand::Stop => "stop",
             LiveCommand::Pause => "pause",
@@ -19,6 +30,12 @@ impl LiveCommand {
             LiveCommand::StepAllocatorEvent => "step_allocator_event",
             LiveCommand::StepInstruction => "step_instruction",
             LiveCommand::StepInstructionOver => "step_instruction_over",
+            LiveCommand::AddUserBreakpointAddress(_) => "break_address",
+            LiveCommand::AddUserBreakpointSymbol(_) => "break_symbol",
+            LiveCommand::DeleteUserBreakpoint(_) => "delete_breakpoint",
+            LiveCommand::EnableUserBreakpoint(_) => "enable_breakpoint",
+            LiveCommand::DisableUserBreakpoint(_) => "disable_breakpoint",
+            LiveCommand::InspectCodeAt { .. } => "inspect_code",
         }
     }
 }
@@ -26,7 +43,7 @@ impl LiveCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LiveCommandId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveCommandMessage {
     pub id: LiveCommandId,
     pub command: LiveCommand,
@@ -100,6 +117,12 @@ pub fn validate_live_command(
         LiveCommand::StepInstruction | LiveCommand::StepInstructionOver => {
             target_status == LiveTargetStatus::Paused
         }
+        LiveCommand::AddUserBreakpointAddress(_)
+        | LiveCommand::AddUserBreakpointSymbol(_)
+        | LiveCommand::DeleteUserBreakpoint(_)
+        | LiveCommand::EnableUserBreakpoint(_)
+        | LiveCommand::DisableUserBreakpoint(_)
+        | LiveCommand::InspectCodeAt { .. } => target_status == LiveTargetStatus::Paused,
     };
 
     if allowed {
@@ -145,6 +168,11 @@ pub enum DebuggerStopReason {
         event_id: usize,
         message: String,
     },
+    UserBreakpoint {
+        breakpoint_id: UserBreakpointId,
+        address: u64,
+        label: String,
+    },
     Signal {
         signal: i32,
         instruction_pointer: Option<u64>,
@@ -170,6 +198,14 @@ impl DebuggerStopReason {
             DebuggerStopReason::AllocatorBreakCondition { event_id, message } => {
                 format!("break condition matched after event #{event_id}: {message}")
             }
+            DebuggerStopReason::UserBreakpoint {
+                breakpoint_id,
+                address,
+                label,
+            } => format!(
+                "breakpoint {} hit at 0x{address:x} ({label})",
+                breakpoint_id.as_u64()
+            ),
             DebuggerStopReason::Signal {
                 signal,
                 instruction_pointer,

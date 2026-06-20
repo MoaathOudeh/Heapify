@@ -89,7 +89,7 @@ impl AllocationTraceMode {
 mod breakpoint;
 pub use breakpoint::{
     Breakpoint, BreakpointKind, BreakpointManager, BreakpointOwner, BreakpointPurpose,
-    ManagedBreakpoint,
+    ManagedBreakpoint, UserBreakpoint, UserBreakpointId, UserBreakpointSpec,
 };
 
 struct TraceHeapState<F>
@@ -278,6 +278,89 @@ impl ProcessSymbolizer {
             source: None,
         })
     }
+
+    pub fn resolve_breakpoint_symbol(&self, requested: &str) -> Result<(String, u64)> {
+        let mut exact = self
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == requested)
+            .collect::<Vec<_>>();
+        exact.sort_by_key(|symbol| (!symbol.is_main_object, symbol.runtime_addr));
+        exact.dedup_by_key(|symbol| (symbol.name.as_str(), symbol.runtime_addr));
+        if exact.len() == 1 {
+            let symbol = exact[0];
+            return Ok((symbol.name.clone(), symbol.runtime_addr));
+        }
+        if exact.len() > 1 {
+            bail!(
+                "ambiguous breakpoint symbol: {requested}; candidates: {}",
+                format_symbol_candidates(&exact)
+            );
+        }
+
+        let versioned_prefix = format!("{requested}@");
+        let mut versioned = self
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name.starts_with(&versioned_prefix))
+            .collect::<Vec<_>>();
+        versioned.sort_by_key(|symbol| (!symbol.is_main_object, symbol.runtime_addr));
+        versioned.dedup_by_key(|symbol| (symbol.name.as_str(), symbol.runtime_addr));
+        if versioned.len() == 1 {
+            let symbol = versioned[0];
+            return Ok((symbol.name.clone(), symbol.runtime_addr));
+        }
+        if versioned.len() > 1 {
+            bail!(
+                "ambiguous breakpoint symbol: {requested}; candidates: {}",
+                format_symbol_candidates(&versioned)
+            );
+        }
+
+        bail!("could not resolve breakpoint symbol: {requested}");
+    }
+
+    pub fn breakpoint_metadata(
+        &self,
+        addr: u64,
+        source_mapper: Option<&TargetSourceMapper>,
+    ) -> (Option<String>, Option<SourceLocation>) {
+        let symbolized = self.symbolize(addr);
+        let resolved_symbol = symbolized.as_ref().map(|symbol| {
+            let mut label = symbol.symbol.clone();
+            if symbol.offset > 0 {
+                label.push_str(&format!("+0x{:x}", symbol.offset));
+            }
+            if let Some(object) = symbol.object_name.as_deref() {
+                if !object.is_empty() {
+                    label = format!("{object}!{label}");
+                }
+            }
+            label
+        });
+        let source = symbolized
+            .and_then(|symbol| symbol.source)
+            .or_else(|| source_mapper.and_then(|source_mapper| source_mapper.lookup(addr)));
+        (resolved_symbol, source)
+    }
+}
+
+fn format_symbol_candidates(symbols: &[&RuntimeSymbol]) -> String {
+    symbols
+        .iter()
+        .take(5)
+        .map(|symbol| {
+            if symbol.is_main_object {
+                format!("{} at 0x{:x}", symbol.name, symbol.runtime_addr)
+            } else {
+                format!(
+                    "{}!{} at 0x{:x}",
+                    symbol.object_name, symbol.name, symbol.runtime_addr
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub struct TargetSourceMapper {
@@ -625,12 +708,14 @@ where
         || None,
         |_, _, _, _, _| Ok(()),
         |_, _, _, _| Ok(()),
+        |_| Ok(()),
+        |_, _, _| Ok(()),
         TraceWaitMode::Blocking,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn trace_heap_with_status_mode_profile_session_live_control<F, S, C, T, R>(
+pub fn trace_heap_with_status_mode_profile_session_live_control<F, S, C, T, R, U, I>(
     program: &str,
     args: &[String],
     on_event: F,
@@ -650,6 +735,8 @@ pub fn trace_heap_with_status_mode_profile_session_live_control<F, S, C, T, R>(
     poll_control: C,
     on_control_status: T,
     on_register_snapshot: R,
+    on_user_breakpoints: U,
+    on_code_inspection: I,
 ) -> Result<()>
 where
     F: FnMut(HeapTraceEvent, TraceHeapContext) -> Result<AllocatorEventControl>,
@@ -663,6 +750,8 @@ where
         String,
     ) -> Result<()>,
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
+    I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
 {
     trace_heap_with_status_mode_profile_session_control(
         program,
@@ -684,12 +773,14 @@ where
         poll_control,
         on_control_status,
         on_register_snapshot,
+        on_user_breakpoints,
+        on_code_inspection,
         TraceWaitMode::Controlled,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn trace_heap_with_status_mode_profile_session_control<F, S, C, T, R>(
+fn trace_heap_with_status_mode_profile_session_control<F, S, C, T, R, U, I>(
     program: &str,
     args: &[String],
     on_event: F,
@@ -709,6 +800,8 @@ fn trace_heap_with_status_mode_profile_session_control<F, S, C, T, R>(
     poll_control: C,
     on_control_status: T,
     on_register_snapshot: R,
+    on_user_breakpoints: U,
+    on_code_inspection: I,
     wait_mode: TraceWaitMode,
 ) -> Result<()>
 where
@@ -723,6 +816,8 @@ where
         String,
     ) -> Result<()>,
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
+    I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
 {
     let launch_config = LaunchConfig {
         target_program: PathBuf::from(program),
@@ -767,6 +862,8 @@ where
                 poll_control,
                 on_control_status,
                 on_register_snapshot,
+                on_user_breakpoints,
+                on_code_inspection,
                 wait_mode,
             )
         }
@@ -921,7 +1018,7 @@ fn run_child(target: TargetCommand) -> Result<()> {
     unreachable!("execvp only returns on error");
 }
 
-fn run_parent_trace_heap<F, C, T, R>(
+fn run_parent_trace_heap<F, C, T, R, I>(
     child: Pid,
     exec_plan: ExecPlan,
     trace_mode: AllocationTraceMode,
@@ -934,6 +1031,8 @@ fn run_parent_trace_heap<F, C, T, R>(
     mut poll_control: C,
     mut on_control_status: T,
     mut on_register_snapshot: R,
+    mut on_user_breakpoints: impl FnMut(Vec<UserBreakpoint>) -> Result<()>,
+    mut on_code_inspection: I,
     wait_mode: TraceWaitMode,
 ) -> Result<()>
 where
@@ -947,6 +1046,7 @@ where
         String,
     ) -> Result<()>,
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
 {
     wait_for_initial_stop_with_status(child, show_status)?;
     let program_path = exec_plan
@@ -1084,7 +1184,10 @@ where
                 &mut pending_nexti,
                 &mut stop_requested_at,
                 &mut breakpoints,
+                &program_path,
                 &mut on_register_snapshot,
+                &mut on_user_breakpoints,
+                &mut on_code_inspection,
             )? == LiveControlOutcome::TargetExited
             {
                 print_missing_libc_metadata_at_trace_end(&mut state);
@@ -1179,6 +1282,75 @@ where
                     continue;
                 }
 
+                if let Some(hit_addr) = hit_addr {
+                    let user_breakpoint_ids = breakpoints.persistent_user_owners_at(hit_addr);
+                    if !user_breakpoint_ids.is_empty() {
+                        let emitted_allocator_event =
+                            if breakpoints.allocator_owner(hit_addr).is_some() {
+                                handle_managed_breakpoint_hit(child, &mut breakpoints, &mut state)?
+                            } else {
+                                handle_persistent_user_breakpoint_step_over(
+                                    child,
+                                    &mut breakpoints,
+                                    hit_addr,
+                                )?;
+                                None
+                            };
+                        if let Some((event_id, _)) = emitted_allocator_event {
+                            emit_register_snapshot_best_effort(
+                                child,
+                                Some(event_id),
+                                &mut on_register_snapshot,
+                                &mut on_control_status,
+                                target_status,
+                            )?;
+                        }
+                        let hit_breakpoints =
+                            breakpoints.record_user_breakpoint_hits(&user_breakpoint_ids);
+                        on_user_breakpoints(breakpoints.list_user_breakpoints())?;
+                        if let Some(primary) = hit_breakpoints.first() {
+                            for extra in hit_breakpoints.iter().skip(1) {
+                                on_control_status(
+                                    None,
+                                    None,
+                                    LiveCommandStatus::Completed,
+                                    LiveTargetStatus::Paused,
+                                    format!(
+                                        "breakpoint {} also hit at {}",
+                                        extra.id.as_u64(),
+                                        extra.location_line()
+                                    ),
+                                )?;
+                            }
+                            let message = format!(
+                                "breakpoint {} hit at {}",
+                                primary.id.as_u64(),
+                                primary.location_line()
+                            );
+                            run_mode = LiveTraceRunMode::Continuous;
+                            pending_step_command_id.take();
+                            paused = true;
+                            pause_requested = false;
+                            target_status = LiveTargetStatus::Paused;
+                            emit_register_snapshot_best_effort(
+                                child,
+                                None,
+                                &mut on_register_snapshot,
+                                &mut on_control_status,
+                                target_status,
+                            )?;
+                            on_control_status(
+                                None,
+                                None,
+                                LiveCommandStatus::Completed,
+                                target_status,
+                                message,
+                            )?;
+                            continue;
+                        }
+                    }
+                }
+
                 let emitted_allocator_event =
                     handle_managed_breakpoint_hit(child, &mut breakpoints, &mut state)?;
                 if let Some((event_id, _)) = emitted_allocator_event {
@@ -1237,7 +1409,10 @@ where
                         &mut pending_nexti,
                         &mut stop_requested_at,
                         &mut breakpoints,
+                        &program_path,
                         &mut on_register_snapshot,
+                        &mut on_user_breakpoints,
+                        &mut on_code_inspection,
                     )? == LiveControlOutcome::TargetExited
                     {
                         print_missing_libc_metadata_at_trace_end(&mut state);
@@ -1328,7 +1503,7 @@ where
     }
 }
 
-fn handle_live_trace_controls<C, T, R>(
+fn handle_live_trace_controls<C, T, R, U, I>(
     child: Pid,
     poll_control: &mut C,
     on_control_status: &mut T,
@@ -1341,7 +1516,10 @@ fn handle_live_trace_controls<C, T, R>(
     pending_nexti: &mut Option<PendingInstructionStepOver>,
     stop_requested_at: &mut Option<Instant>,
     breakpoints: &mut BreakpointManager,
+    program_path: &str,
     on_register_snapshot: &mut R,
+    on_user_breakpoints: &mut U,
+    on_code_inspection: &mut I,
 ) -> Result<LiveControlOutcome>
 where
     C: FnMut() -> Option<LiveCommandMessage>,
@@ -1353,13 +1531,15 @@ where
         String,
     ) -> Result<()>,
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
+    I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
 {
     while let Some(message) = poll_control() {
-        let command = message.command;
-        if let Err(reason) = validate_live_command(*target_status, command) {
+        let command = message.command.clone();
+        if let Err(reason) = validate_live_command(*target_status, command.clone()) {
             on_control_status(
                 Some(message.id),
-                Some(command),
+                Some(command.clone()),
                 LiveCommandStatus::Rejected,
                 *target_status,
                 reason,
@@ -1367,7 +1547,177 @@ where
             continue;
         }
 
-        match command {
+        match command.clone() {
+            LiveCommand::InspectCodeAt {
+                address,
+                breakpoint_id,
+            } => {
+                let pause_state = LiveWorkerPauseState {
+                    ptrace_stopped: *paused,
+                    user_visible_paused: *target_status == LiveTargetStatus::Paused,
+                    step_in_flight: None,
+                    temporary_return_breakpoint_in_flight: breakpoints
+                        .has_temporary_return_breakpoints(),
+                    managed_breakpoints_rearmed: breakpoints.all_breakpoints_rearmed(),
+                };
+                if let Err(reason) = pause_state.can_user_step_instruction() {
+                    on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Rejected,
+                        *target_status,
+                        reason,
+                    )?;
+                    continue;
+                }
+                on_control_status(
+                    Some(message.id),
+                    Some(command.clone()),
+                    LiveCommandStatus::Accepted,
+                    *target_status,
+                    format!("inspecting code at 0x{address:x}"),
+                )?;
+                match on_code_inspection(address, breakpoint_id, child) {
+                    Ok(()) => on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Completed,
+                        *target_status,
+                        match breakpoint_id {
+                            Some(id) => {
+                                format!("inspecting breakpoint {} at 0x{address:x}", id.as_u64())
+                            }
+                            None => format!("inspecting code at 0x{address:x}"),
+                        },
+                    )?,
+                    Err(err) => on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Failed,
+                        *target_status,
+                        format!("code inspection failed: {err}"),
+                    )?,
+                }
+            }
+            LiveCommand::AddUserBreakpointAddress(addr) => {
+                let symbolizer = ProcessSymbolizer::from_process(child, program_path).ok();
+                let source_mapper = TargetSourceMapper::from_process(child, program_path).ok();
+                let (resolved_symbol, source) = symbolizer
+                    .as_ref()
+                    .map(|symbolizer| symbolizer.breakpoint_metadata(addr, source_mapper.as_ref()))
+                    .unwrap_or_else(|| {
+                        (
+                            None,
+                            source_mapper
+                                .as_ref()
+                                .and_then(|source_mapper| source_mapper.lookup(addr)),
+                        )
+                    });
+                let label = resolved_symbol
+                    .clone()
+                    .unwrap_or_else(|| format!("0x{addr:x}"));
+                let result = breakpoints.add_user_breakpoint(
+                    child,
+                    UserBreakpointSpec::Address(addr),
+                    addr,
+                    label,
+                    resolved_symbol,
+                    source,
+                );
+                complete_breakpoint_management_command(
+                    result,
+                    message.id,
+                    command,
+                    *target_status,
+                    breakpoints,
+                    on_control_status,
+                    on_user_breakpoints,
+                    |breakpoint| {
+                        format!(
+                            "breakpoint {} set at {}",
+                            breakpoint.id.as_u64(),
+                            breakpoint.location_line()
+                        )
+                    },
+                )?;
+            }
+            LiveCommand::AddUserBreakpointSymbol(symbol) => {
+                let result = ProcessSymbolizer::from_process(child, program_path)
+                    .and_then(|symbolizer| {
+                        let source_mapper =
+                            TargetSourceMapper::from_process(child, program_path).ok();
+                        symbolizer.resolve_breakpoint_symbol(&symbol).map(
+                            |(resolved_name, addr)| {
+                                let (resolved_symbol, source) =
+                                    symbolizer.breakpoint_metadata(addr, source_mapper.as_ref());
+                                (resolved_name, addr, resolved_symbol, source)
+                            },
+                        )
+                    })
+                    .and_then(|(resolved_name, addr, resolved_symbol, source)| {
+                        let label = resolved_symbol.clone().unwrap_or(resolved_name);
+                        breakpoints.add_user_breakpoint(
+                            child,
+                            UserBreakpointSpec::Symbol(symbol),
+                            addr,
+                            label,
+                            resolved_symbol,
+                            source,
+                        )
+                    });
+                complete_breakpoint_management_command(
+                    result,
+                    message.id,
+                    command,
+                    *target_status,
+                    breakpoints,
+                    on_control_status,
+                    on_user_breakpoints,
+                    |breakpoint| {
+                        format!(
+                            "breakpoint {} set at {}",
+                            breakpoint.id.as_u64(),
+                            breakpoint.location_line()
+                        )
+                    },
+                )?;
+            }
+            LiveCommand::DeleteUserBreakpoint(id) => {
+                complete_breakpoint_management_command(
+                    breakpoints.delete_user_breakpoint(child, id),
+                    message.id,
+                    command,
+                    *target_status,
+                    breakpoints,
+                    on_control_status,
+                    on_user_breakpoints,
+                    |breakpoint| format!("breakpoint {} deleted", breakpoint.id.as_u64()),
+                )?;
+            }
+            LiveCommand::EnableUserBreakpoint(id) => {
+                complete_breakpoint_management_command(
+                    breakpoints.enable_user_breakpoint(child, id),
+                    message.id,
+                    command,
+                    *target_status,
+                    breakpoints,
+                    on_control_status,
+                    on_user_breakpoints,
+                    |breakpoint| format!("breakpoint {} enabled", breakpoint.id.as_u64()),
+                )?;
+            }
+            LiveCommand::DisableUserBreakpoint(id) => {
+                complete_breakpoint_management_command(
+                    breakpoints.disable_user_breakpoint(child, id),
+                    message.id,
+                    command,
+                    *target_status,
+                    breakpoints,
+                    on_control_status,
+                    on_user_breakpoints,
+                    |breakpoint| format!("breakpoint {} disabled", breakpoint.id.as_u64()),
+                )?;
+            }
             LiveCommand::Stop => {
                 *run_mode = LiveTraceRunMode::Continuous;
                 *pending_pause_command_id = None;
@@ -1378,7 +1728,7 @@ where
                 }
                 on_control_status(
                     Some(message.id),
-                    Some(command),
+                    Some(command.clone()),
                     LiveCommandStatus::Accepted,
                     *target_status,
                     "stop accepted".to_string(),
@@ -1389,7 +1739,7 @@ where
                     *target_status = LiveTargetStatus::Stopping;
                     on_control_status(
                         Some(message.id),
-                        Some(command),
+                        Some(command.clone()),
                         LiveCommandStatus::Completed,
                         *target_status,
                         "stopping target...".to_string(),
@@ -1408,7 +1758,7 @@ where
                 *pending_pause_command_id = Some(message.id);
                 on_control_status(
                     Some(message.id),
-                    Some(command),
+                    Some(command.clone()),
                     LiveCommandStatus::Accepted,
                     *target_status,
                     "pause requested...".to_string(),
@@ -1419,7 +1769,7 @@ where
                 if *paused {
                     on_control_status(
                         Some(message.id),
-                        Some(command),
+                        Some(command.clone()),
                         LiveCommandStatus::Accepted,
                         *target_status,
                         "resume accepted".to_string(),
@@ -1431,7 +1781,7 @@ where
                             *target_status = LiveTargetStatus::Running;
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Completed,
                                 *target_status,
                                 "target running".to_string(),
@@ -1441,7 +1791,7 @@ where
                             *target_status = LiveTargetStatus::Paused;
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Failed,
                                 *target_status,
                                 format!("resume failed: {err}"),
@@ -1458,7 +1808,7 @@ where
                 }
                 on_control_status(
                     Some(message.id),
-                    Some(command),
+                    Some(command.clone()),
                     LiveCommandStatus::Accepted,
                     *target_status,
                     "continue accepted".to_string(),
@@ -1471,7 +1821,7 @@ where
                             *target_status = LiveTargetStatus::Running;
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Completed,
                                 *target_status,
                                 "target running".to_string(),
@@ -1481,7 +1831,7 @@ where
                             *target_status = LiveTargetStatus::Paused;
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Failed,
                                 *target_status,
                                 format!("continue failed: {err}"),
@@ -1492,7 +1842,7 @@ where
                     *target_status = LiveTargetStatus::Running;
                     on_control_status(
                         Some(message.id),
-                        Some(command),
+                        Some(command.clone()),
                         LiveCommandStatus::Completed,
                         *target_status,
                         "target running".to_string(),
@@ -1510,7 +1860,7 @@ where
                             *pending_step_command_id = Some(message.id);
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Accepted,
                                 *target_status,
                                 "stepping to next allocator event...".to_string(),
@@ -1520,7 +1870,7 @@ where
                             *target_status = LiveTargetStatus::Paused;
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Failed,
                                 *target_status,
                                 format!("step failed: {err}"),
@@ -1541,7 +1891,7 @@ where
                 if let Err(reason) = pause_state.can_user_step_instruction() {
                     on_control_status(
                         Some(message.id),
-                        Some(command),
+                        Some(command.clone()),
                         LiveCommandStatus::Rejected,
                         *target_status,
                         reason,
@@ -1555,7 +1905,7 @@ where
                 *target_status = LiveTargetStatus::SteppingInstruction;
                 on_control_status(
                     Some(message.id),
-                    Some(command),
+                    Some(command.clone()),
                     LiveCommandStatus::Accepted,
                     *target_status,
                     match before_rip {
@@ -1572,7 +1922,7 @@ where
                         *target_status = LiveTargetStatus::Paused;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format!("instruction step failed: {err}"),
@@ -1597,7 +1947,7 @@ where
                         .map(|snapshot| snapshot.instruction_pointer);
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Completed,
                             *target_status,
                             format_instruction_step_completed(before_rip, after_rip),
@@ -1618,7 +1968,7 @@ where
                         .map(|snapshot| snapshot.instruction_pointer);
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format_instruction_step_signal(signal, after_rip),
@@ -1629,7 +1979,7 @@ where
                         *target_status = LiveTargetStatus::Exited;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Completed,
                             *target_status,
                             format!("target exited with status {code}"),
@@ -1641,7 +1991,7 @@ where
                         *target_status = LiveTargetStatus::Exited;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Completed,
                             *target_status,
                             format!("target terminated by signal {signal:?}"),
@@ -1653,7 +2003,7 @@ where
                         *target_status = LiveTargetStatus::Paused;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format!("instruction step stopped unexpectedly: {status:?}"),
@@ -1673,7 +2023,7 @@ where
                 if let Err(reason) = pause_state.can_user_step_instruction() {
                     on_control_status(
                         Some(message.id),
-                        Some(command),
+                        Some(command.clone()),
                         LiveCommandStatus::Rejected,
                         *target_status,
                         reason,
@@ -1686,7 +2036,7 @@ where
                     Err(err) => {
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format!("nexti failed: {err}"),
@@ -1700,7 +2050,7 @@ where
                     Err(err) => {
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format!("nexti decode failed at RIP=0x{before_rip:x}: {err}"),
@@ -1721,7 +2071,7 @@ where
                         Err(err) => {
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Failed,
                                 *target_status,
                                 format!("nexti failed: {err}"),
@@ -1742,7 +2092,7 @@ where
                             });
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Accepted,
                                 *target_status,
                                 format!(
@@ -1756,7 +2106,7 @@ where
                             *target_status = LiveTargetStatus::Paused;
                             on_control_status(
                                 Some(message.id),
-                                Some(command),
+                                Some(command.clone()),
                                 LiveCommandStatus::Failed,
                                 *target_status,
                                 format!("nexti failed: {err}"),
@@ -1769,7 +2119,7 @@ where
                 *target_status = LiveTargetStatus::SteppingInstructionOver;
                 on_control_status(
                     Some(message.id),
-                    Some(command),
+                    Some(command.clone()),
                     LiveCommandStatus::Accepted,
                     *target_status,
                     format!("nexti non-call single-step at RIP=0x{before_rip:x}"),
@@ -1782,7 +2132,7 @@ where
                         *target_status = LiveTargetStatus::Paused;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format!("nexti failed: {err}"),
@@ -1806,7 +2156,7 @@ where
                         )?;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Completed,
                             *target_status,
                             format_instruction_step_over_completed(Some(before_rip), after_rip),
@@ -1824,7 +2174,7 @@ where
                         )?;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format_instruction_step_signal(
@@ -1840,7 +2190,7 @@ where
                         *target_status = LiveTargetStatus::Exited;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Completed,
                             *target_status,
                             format!("target exited with status {code}"),
@@ -1852,7 +2202,7 @@ where
                         *target_status = LiveTargetStatus::Exited;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Completed,
                             *target_status,
                             format!("target terminated by signal {signal:?}"),
@@ -1864,7 +2214,7 @@ where
                         *target_status = LiveTargetStatus::Paused;
                         on_control_status(
                             Some(message.id),
-                            Some(command),
+                            Some(command.clone()),
                             LiveCommandStatus::Failed,
                             *target_status,
                             format!("nexti stopped unexpectedly: {status:?}"),
@@ -1883,6 +2233,54 @@ fn should_continue_after_allocator_event(run_mode: LiveTraceRunMode) -> bool {
         run_mode,
         LiveTraceRunMode::Continuous | LiveTraceRunMode::UserInstructionStepOver
     )
+}
+
+fn complete_breakpoint_management_command<T, U>(
+    result: Result<UserBreakpoint>,
+    command_id: LiveCommandId,
+    command: LiveCommand,
+    target_status: LiveTargetStatus,
+    breakpoints: &BreakpointManager,
+    on_control_status: &mut T,
+    on_user_breakpoints: &mut U,
+    message: impl FnOnce(&UserBreakpoint) -> String,
+) -> Result<()>
+where
+    T: FnMut(
+        Option<LiveCommandId>,
+        Option<LiveCommand>,
+        LiveCommandStatus,
+        LiveTargetStatus,
+        String,
+    ) -> Result<()>,
+    U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
+{
+    on_control_status(
+        Some(command_id),
+        Some(command.clone()),
+        LiveCommandStatus::Accepted,
+        target_status,
+        format!("{} accepted", command.as_str()),
+    )?;
+    match result {
+        Ok(breakpoint) => {
+            on_user_breakpoints(breakpoints.list_user_breakpoints())?;
+            on_control_status(
+                Some(command_id),
+                Some(command.clone()),
+                LiveCommandStatus::Completed,
+                target_status,
+                message(&breakpoint),
+            )
+        }
+        Err(err) => on_control_status(
+            Some(command_id),
+            Some(command.clone()),
+            LiveCommandStatus::Failed,
+            target_status,
+            err.to_string(),
+        ),
+    }
 }
 
 fn should_pause_after_allocator_event(
@@ -2472,6 +2870,46 @@ where
         LiveTargetStatus::Paused,
         format_instruction_step_over_completed(Some(pending.from_rip), after_rip),
     )
+}
+
+fn handle_persistent_user_breakpoint_step_over(
+    child: Pid,
+    manager: &mut BreakpointManager,
+    hit_addr: u64,
+) -> Result<()> {
+    let mut regs = ptrace::getregs(child).context("failed to read child registers")?;
+    if regs.rip.saturating_sub(1) != hit_addr {
+        bail!(
+            "unexpected user breakpoint SIGTRAP at rip=0x{:x} (hit address 0x{hit_addr:x})",
+            regs.rip
+        );
+    }
+
+    regs.rip = hit_addr;
+    ptrace::setregs(child, regs).context("failed to restore RIP after user breakpoint")?;
+    manager
+        .get_mut(hit_addr)
+        .with_context(|| format!("missing user breakpoint at 0x{hit_addr:x}"))?
+        .breakpoint
+        .disable(child)
+        .with_context(|| format!("failed to disable breakpoint at 0x{hit_addr:x}"))?;
+
+    let step_kind = StepKind::InternalBreakpointStepOver;
+    debug_assert_eq!(step_kind, StepKind::InternalBreakpointStepOver);
+    ptrace::step(child, None).context("failed to single-step child")?;
+    match waitpid(child, None).context("failed waiting for single-step stop")? {
+        WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {}
+        status => bail!("expected SIGTRAP after single-step, got {status:?}"),
+    }
+
+    if let Some(managed) = manager.get_mut(hit_addr) {
+        managed
+            .breakpoint
+            .enable(child)
+            .with_context(|| format!("failed to re-enable breakpoint at 0x{hit_addr:x}"))?;
+    }
+
+    Ok(())
 }
 
 fn handle_breakpoint_hit(child: Pid, breakpoint: &mut Breakpoint) -> Result<()> {
@@ -4740,7 +5178,7 @@ mod tests {
         LibcMetadata, LiveCommand, LiveCommandId, LiveTargetStatus, LiveTraceRunMode,
         LiveWorkerPauseState, ManagedBreakpoint, MemoryMapping, ProcessSymbolizer, RegisterArch,
         RegisterRole, RuntimeSymbol, StdinConfig, StepKind, TargetMemoryReader, TargetSymbolizer,
-        TraceHeapState,
+        TraceHeapState, UserBreakpoint, UserBreakpointId, UserBreakpointSpec,
     };
     use heapify_core::glibc::{
         BinExperimentRole, GlibcChunkHeader, GlibcHeapSnapshot, MainArenaRoleHint,
@@ -4966,6 +5404,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_live_command_allows_inspect_code_only_while_paused() {
+        let command = LiveCommand::InspectCodeAt {
+            address: 0x4011a5,
+            breakpoint_id: Some(UserBreakpointId(1)),
+        };
+        assert!(super::validate_live_command(LiveTargetStatus::Paused, command.clone()).is_ok());
+        for status in [
+            LiveTargetStatus::NotStarted,
+            LiveTargetStatus::Running,
+            LiveTargetStatus::SteppingToNextAllocatorEvent,
+            LiveTargetStatus::SteppingInstruction,
+            LiveTargetStatus::SteppingInstructionOver,
+            LiveTargetStatus::Stopping,
+            LiveTargetStatus::Exited,
+        ] {
+            assert!(super::validate_live_command(status, command.clone()).is_err());
+        }
+    }
+
+    #[test]
     fn stable_pause_guard_rejects_internal_breakpoint_step_over() {
         let state = LiveWorkerPauseState {
             step_in_flight: Some(StepKind::InternalBreakpointStepOver),
@@ -5025,6 +5483,15 @@ mod tests {
         assert_eq!(
             DebuggerStopReason::AllocatorEventStep { event_id: 7 }.summary_line(),
             "paused after allocator event #7"
+        );
+        assert_eq!(
+            DebuggerStopReason::UserBreakpoint {
+                breakpoint_id: UserBreakpointId(2),
+                address: 0x4011a5,
+                label: "main+0x37".to_string()
+            }
+            .summary_line(),
+            "breakpoint 2 hit at 0x4011a5 (main+0x37)"
         );
     }
 
@@ -5177,6 +5644,13 @@ mod tests {
             .purpose(),
             BreakpointPurpose::UserInstructionStepOver
         );
+        assert_eq!(
+            BreakpointOwner::UserPersistent {
+                breakpoint_id: UserBreakpointId(1)
+            }
+            .purpose(),
+            BreakpointPurpose::UserPersistent
+        );
     }
 
     #[test]
@@ -5211,6 +5685,208 @@ mod tests {
             BreakpointOwner::Allocator(super::BreakpointKind::MallocEntry)
         ));
         assert!(managed.breakpoint.enabled);
+    }
+
+    #[test]
+    fn user_breakpoint_ids_are_monotonic_and_not_reused() {
+        let mut manager = manager_with_enabled_allocator_owner(0x401005);
+        let first = manager
+            .add_user_breakpoint(
+                Pid::from_raw(999999),
+                UserBreakpointSpec::Address(0x401005),
+                0x401005,
+                "main".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let second = manager
+            .add_user_breakpoint(
+                Pid::from_raw(999999),
+                UserBreakpointSpec::Address(0x401005),
+                0x401005,
+                "main+0x1".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        manager
+            .delete_user_breakpoint(Pid::from_raw(999999), first.id)
+            .unwrap();
+        let third = manager
+            .add_user_breakpoint(
+                Pid::from_raw(999999),
+                UserBreakpointSpec::Address(0x401005),
+                0x401005,
+                "main+0x2".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(first.id.as_u64(), 1);
+        assert_eq!(second.id.as_u64(), 2);
+        assert_eq!(third.id.as_u64(), 3);
+    }
+
+    #[test]
+    fn persistent_owner_shares_existing_physical_breakpoint_without_duplication() {
+        let mut manager = manager_with_enabled_allocator_owner(0x401005);
+
+        let breakpoint = manager
+            .add_user_breakpoint(
+                Pid::from_raw(999999),
+                UserBreakpointSpec::Address(0x401005),
+                0x401005,
+                "main".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        manager
+            .enable_user_breakpoint(Pid::from_raw(999999), breakpoint.id)
+            .unwrap();
+
+        let managed = manager.breakpoints.get(&0x401005).unwrap();
+        assert_eq!(managed.owners.len(), 2);
+        assert_eq!(
+            manager.persistent_user_owners_at(0x401005),
+            vec![breakpoint.id]
+        );
+        assert!(managed.breakpoint.enabled);
+    }
+
+    #[test]
+    fn removing_persistent_owner_preserves_allocator_owner() {
+        let mut manager = manager_with_enabled_allocator_owner(0x401005);
+        let breakpoint = manager
+            .add_user_breakpoint(
+                Pid::from_raw(999999),
+                UserBreakpointSpec::Address(0x401005),
+                0x401005,
+                "main".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        manager
+            .disable_user_breakpoint(Pid::from_raw(999999), breakpoint.id)
+            .unwrap();
+
+        let managed = manager.breakpoints.get(&0x401005).unwrap();
+        assert_eq!(managed.owners.len(), 1);
+        assert!(matches!(
+            managed.owners[0],
+            BreakpointOwner::Allocator(super::BreakpointKind::MallocEntry)
+        ));
+        assert!(managed.breakpoint.enabled);
+    }
+
+    #[test]
+    fn removing_allocator_owner_preserves_persistent_owner() {
+        let mut manager = manager_with_enabled_allocator_owner(0x401005);
+        let breakpoint = manager
+            .add_user_breakpoint(
+                Pid::from_raw(999999),
+                UserBreakpointSpec::Address(0x401005),
+                0x401005,
+                "main".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        manager
+            .remove_owner_at(Pid::from_raw(999999), 0x401005, |owner| {
+                matches!(owner, BreakpointOwner::Allocator(_))
+            })
+            .unwrap();
+
+        let managed = manager.breakpoints.get(&0x401005).unwrap();
+        assert_eq!(managed.owners.len(), 1);
+        assert!(matches!(
+            managed.owners[0],
+            BreakpointOwner::UserPersistent { breakpoint_id } if breakpoint_id == breakpoint.id
+        ));
+        assert!(managed.breakpoint.enabled);
+    }
+
+    #[test]
+    fn disabling_and_reenabling_preserves_registry_state_and_hit_count() {
+        let mut manager = manager_with_enabled_allocator_owner(0x401005);
+        let breakpoint = manager
+            .add_user_breakpoint(
+                Pid::from_raw(999999),
+                UserBreakpointSpec::Address(0x401005),
+                0x401005,
+                "main".to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        manager.record_user_breakpoint_hits(&[breakpoint.id]);
+
+        let disabled = manager
+            .disable_user_breakpoint(Pid::from_raw(999999), breakpoint.id)
+            .unwrap();
+        let enabled = manager
+            .enable_user_breakpoint(Pid::from_raw(999999), breakpoint.id)
+            .unwrap();
+
+        assert!(!disabled.enabled);
+        assert!(enabled.enabled);
+        assert_eq!(enabled.hit_count, 1);
+        assert_eq!(enabled.resolved_address, 0x401005);
+    }
+
+    #[test]
+    fn deleting_unknown_user_breakpoint_errors() {
+        let mut manager = BreakpointManager::default();
+
+        let err = manager
+            .delete_user_breakpoint(Pid::from_raw(999999), UserBreakpointId(99))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unknown breakpoint id 99"));
+    }
+
+    #[test]
+    fn user_breakpoint_formatting_is_stable() {
+        let breakpoint = UserBreakpoint {
+            id: UserBreakpointId(2),
+            spec: UserBreakpointSpec::Symbol("main".to_string()),
+            resolved_address: 0x4011a5,
+            enabled: true,
+            hit_count: 3,
+            label: "main+0x37".to_string(),
+            resolved_symbol: Some("main+0x37".to_string()),
+            source: None,
+        };
+
+        assert_eq!(breakpoint.location_line(), "0x4011a5 (main+0x37)");
+        assert_eq!(
+            breakpoint.summary_line(),
+            "2    y   3      0x4011a5 main+0x37"
+        );
+    }
+
+    fn manager_with_enabled_allocator_owner(addr: u64) -> BreakpointManager {
+        let mut manager = BreakpointManager::default();
+        manager.breakpoints.insert(
+            addr,
+            ManagedBreakpoint {
+                breakpoint: Breakpoint {
+                    addr,
+                    original_byte: 0x90,
+                    enabled: true,
+                },
+                owners: vec![BreakpointOwner::Allocator(
+                    super::BreakpointKind::MallocEntry,
+                )],
+            },
+        );
+        manager
     }
 
     #[test]

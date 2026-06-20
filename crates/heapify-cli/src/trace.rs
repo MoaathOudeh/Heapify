@@ -96,6 +96,13 @@ pub enum LiveTraceUpdate {
         event_id: Option<usize>,
         context: CodeContext,
     },
+    CodeInspection {
+        address: u64,
+        breakpoint_id: Option<UserBreakpointId>,
+    },
+    UserBreakpoints {
+        breakpoints: Vec<UserBreakpoint>,
+    },
     BreakMatched(AllocatorBreakMatch),
     SessionEnd(JsonSessionEnd),
 }
@@ -155,7 +162,9 @@ impl LiveTraceSink for CurrentOutputSink<'_> {
             | LiveTraceUpdate::ProcessMaps { .. }
             | LiveTraceUpdate::RegisterSnapshot { .. }
             | LiveTraceUpdate::StackSnapshot { .. }
-            | LiveTraceUpdate::CodeContext { .. } => {}
+            | LiveTraceUpdate::CodeContext { .. }
+            | LiveTraceUpdate::CodeInspection { .. }
+            | LiveTraceUpdate::UserBreakpoints { .. } => {}
             LiveTraceUpdate::BreakMatched(break_match) => {
                 if self.json_writer.is_none() {
                     println!(
@@ -238,6 +247,8 @@ pub(crate) fn write_live_update_json(
         | LiveTraceUpdate::RegisterSnapshot { .. }
         | LiveTraceUpdate::StackSnapshot { .. }
         | LiveTraceUpdate::CodeContext { .. }
+        | LiveTraceUpdate::CodeInspection { .. }
+        | LiveTraceUpdate::UserBreakpoints { .. }
         | LiveTraceUpdate::BreakMatched(_) => {}
         LiveTraceUpdate::SessionEnd(session) => {
             writer.write_record(&session.record)?;

@@ -31,6 +31,11 @@ pub struct LiveTuiApp {
     pub latest_stack_snapshot: Option<StackSnapshot>,
     pub stack_snapshots_by_event_id: BTreeMap<usize, StackSnapshot>,
     pub latest_process_maps: Option<ProcessMapsSnapshot>,
+    pub user_breakpoints: Vec<UserBreakpoint>,
+    pub selected_user_breakpoint_index: Option<usize>,
+    pub breakpoint_tab_scroll: usize,
+    pub code_view_address: Option<u64>,
+    pub code_view_breakpoint_id: Option<UserBreakpointId>,
     pub focused_debugger_pane: LiveDebuggerPane,
     pub active_right_tab: LiveRightTab,
     pub logs: VecDeque<String>,
@@ -75,6 +80,7 @@ pub enum LiveRightTab {
     Stack,
     Logs,
     Maps,
+    Breakpoints,
 }
 
 impl LiveRightTab {
@@ -84,6 +90,7 @@ impl LiveRightTab {
             LiveRightTab::Stack => "stack",
             LiveRightTab::Logs => "logs",
             LiveRightTab::Maps => "maps",
+            LiveRightTab::Breakpoints => "breaks",
         }
     }
 }
@@ -187,6 +194,12 @@ pub enum ConsoleCommand {
     Stack,
     Maps,
     HeapJump(HeapSearchQuery),
+    BreakAddress(u64),
+    BreakSymbol(String),
+    InfoBreakpoints,
+    DeleteBreakpoint(UserBreakpointId),
+    EnableBreakpoint(UserBreakpointId),
+    DisableBreakpoint(UserBreakpointId),
     SelectRightTab(LiveRightTab),
     Unknown(String),
 }
@@ -232,6 +245,11 @@ impl Default for LiveTuiApp {
             latest_stack_snapshot: None,
             stack_snapshots_by_event_id: BTreeMap::new(),
             latest_process_maps: None,
+            user_breakpoints: Vec::new(),
+            selected_user_breakpoint_index: None,
+            breakpoint_tab_scroll: 0,
+            code_view_address: None,
+            code_view_breakpoint_id: None,
             focused_debugger_pane: LiveDebuggerPane::Trace,
             active_right_tab: LiveRightTab::Heap,
             logs: VecDeque::new(),
@@ -351,8 +369,29 @@ impl LiveTuiApp {
                     self.code_context_by_event_id.insert(event_id, context);
                 }
             }
+            LiveTraceUpdate::CodeInspection {
+                address,
+                breakpoint_id,
+            } => {
+                self.code_view_address = Some(address);
+                self.code_view_breakpoint_id = breakpoint_id;
+                self.code_follow_rip = false;
+                self.focused_debugger_pane = LiveDebuggerPane::Code;
+                self.sync_legacy_focus_from_debugger_pane();
+                if let Some(id) = breakpoint_id {
+                    self.push_log_line(format!(
+                        "inspecting breakpoint {} at 0x{address:x}",
+                        id.as_u64()
+                    ));
+                }
+            }
             LiveTraceUpdate::BreakMatched(break_match) => {
                 self.apply_break_match(break_match);
+            }
+            LiveTraceUpdate::UserBreakpoints { breakpoints } => {
+                let selected_id = self.selected_breakpoint_id();
+                self.user_breakpoints = breakpoints;
+                self.normalize_selected_user_breakpoint_with_previous_id(selected_id);
             }
             LiveTraceUpdate::SessionEnd(session) => {
                 let (exit_status, event_count) = match &session.record {
@@ -442,12 +481,12 @@ impl LiveTuiApp {
         message: String,
     ) {
         if let Some(reason) =
-            Self::infer_debugger_stop_reason(command, status, target_status, &message)
+            Self::infer_debugger_stop_reason(command.clone(), status, target_status, &message)
         {
             self.latest_stop_reason = Some(reason);
         }
         self.target_status = target_status;
-        self.last_command = command;
+        self.last_command = command.clone();
         self.last_command_status = Some(status);
         self.last_command_message = Some(message.clone());
         if target_status == LiveTargetStatus::Paused {
@@ -457,7 +496,10 @@ impl LiveTuiApp {
             self.follow_tail = false;
         }
         self.status_line = message;
-        let command = command.map(LiveCommand::as_str).unwrap_or("target");
+        let command = command
+            .as_ref()
+            .map(LiveCommand::as_str)
+            .unwrap_or("target");
         self.push_log_line(format!(
             "{command}: {} ({})",
             self.status_line,
@@ -512,8 +554,8 @@ impl LiveTuiApp {
         &mut self,
         command: LiveCommand,
     ) -> std::result::Result<LiveCommandMessage, String> {
-        validate_live_command(self.target_status, command).map_err(|reason| {
-            self.last_command = Some(command);
+        validate_live_command(self.target_status, command.clone()).map_err(|reason| {
+            self.last_command = Some(command.clone());
             self.last_command_status = Some(LiveCommandStatus::Rejected);
             self.last_command_message = Some(reason.clone());
             self.status_line = reason.clone();
@@ -522,10 +564,10 @@ impl LiveTuiApp {
 
         let message = LiveCommandMessage {
             id: LiveCommandId(self.next_command_id),
-            command,
+            command: command.clone(),
         };
         self.next_command_id += 1;
-        self.last_command = Some(command);
+        self.last_command = Some(command.clone());
         self.last_command_status = Some(LiveCommandStatus::Accepted);
         self.last_command_message = Some(format!("{} accepted", command.as_str()));
         Ok(message)
@@ -567,6 +609,9 @@ impl LiveTuiApp {
         if target_status != LiveTargetStatus::Paused {
             return None;
         }
+        if let Some(reason) = Self::parse_user_breakpoint_hit(message) {
+            return Some(reason);
+        }
         match (command, status) {
             (Some(LiveCommand::Pause), LiveCommandStatus::Completed) => {
                 Some(DebuggerStopReason::UserPause)
@@ -598,6 +643,32 @@ impl LiveTuiApp {
             }
             _ => None,
         }
+    }
+
+    fn parse_user_breakpoint_hit(message: &str) -> Option<DebuggerStopReason> {
+        let rest = message.strip_prefix("breakpoint ")?;
+        let (id, rest) = rest.split_once(" hit at ")?;
+        let breakpoint_id = UserBreakpointId(id.parse().ok()?);
+        let addr = Self::parse_rip_like_hex(rest)?;
+        let label = rest
+            .split_once('(')
+            .and_then(|(_, label)| label.strip_suffix(')'))
+            .unwrap_or("")
+            .to_string();
+        Some(DebuggerStopReason::UserBreakpoint {
+            breakpoint_id,
+            address: addr,
+            label,
+        })
+    }
+
+    fn parse_rip_like_hex(message: &str) -> Option<u64> {
+        let index = message.find("0x")?;
+        let hex = message[index + 2..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_hexdigit())
+            .collect::<String>();
+        u64::from_str_radix(&hex, 16).ok()
     }
 
     pub(crate) fn parse_hex_transition(message: &str) -> Option<(u64, u64)> {
@@ -685,6 +756,9 @@ impl LiveTuiApp {
                 LiveRightTab::Maps => {
                     self.maps_tab_scroll = scroll_delta(self.maps_tab_scroll, amount);
                 }
+                LiveRightTab::Breakpoints => {
+                    self.breakpoint_tab_scroll = scroll_delta(self.breakpoint_tab_scroll, amount);
+                }
             },
             LiveDebuggerPane::Console => {}
         }
@@ -707,6 +781,11 @@ impl LiveTuiApp {
                 LiveRightTab::Logs => self.related_records_scroll = 0,
                 LiveRightTab::Stack => self.stack_tab_scroll = 0,
                 LiveRightTab::Maps => self.maps_tab_scroll = 0,
+                LiveRightTab::Breakpoints => {
+                    self.breakpoint_tab_scroll = 0;
+                    self.selected_user_breakpoint_index =
+                        (!self.user_breakpoints.is_empty()).then_some(0);
+                }
             },
             LiveDebuggerPane::Console => {}
         }
@@ -729,6 +808,11 @@ impl LiveTuiApp {
                 LiveRightTab::Logs => self.related_records_scroll = usize::MAX,
                 LiveRightTab::Stack => self.stack_tab_scroll = usize::MAX,
                 LiveRightTab::Maps => self.maps_tab_scroll = usize::MAX,
+                LiveRightTab::Breakpoints => {
+                    self.breakpoint_tab_scroll = usize::MAX;
+                    self.selected_user_breakpoint_index =
+                        self.user_breakpoints.len().checked_sub(1);
+                }
             },
             LiveDebuggerPane::Console => {}
         }
@@ -743,7 +827,9 @@ impl LiveTuiApp {
             LiveDebuggerPane::RightTab => match self.active_right_tab {
                 LiveRightTab::Heap => LiveTuiPane::HeapLayout,
                 LiveRightTab::Logs => LiveTuiPane::RelatedRecords,
-                LiveRightTab::Stack | LiveRightTab::Maps => LiveTuiPane::Events,
+                LiveRightTab::Stack | LiveRightTab::Maps | LiveRightTab::Breakpoints => {
+                    LiveTuiPane::Events
+                }
             },
         };
     }
@@ -769,8 +855,87 @@ impl LiveTuiApp {
     pub(crate) fn focus_code_and_recenter(&mut self) {
         self.focused_debugger_pane = LiveDebuggerPane::Code;
         self.sync_legacy_focus_from_debugger_pane();
+        self.code_view_address = None;
+        self.code_view_breakpoint_id = None;
         self.code_follow_rip = true;
         self.recenter_code_on_rip();
+    }
+
+    pub(crate) fn selected_user_breakpoint(&self) -> Option<&UserBreakpoint> {
+        self.selected_user_breakpoint_index
+            .and_then(|index| self.user_breakpoints.get(index))
+    }
+
+    pub(crate) fn selected_breakpoint_id(&self) -> Option<UserBreakpointId> {
+        self.selected_user_breakpoint()
+            .map(|breakpoint| breakpoint.id)
+    }
+
+    pub(crate) fn select_next_user_breakpoint(&mut self) {
+        self.normalize_selected_user_breakpoint();
+        if self.user_breakpoints.is_empty() {
+            return;
+        }
+        let index = self.selected_user_breakpoint_index.unwrap_or(0);
+        self.selected_user_breakpoint_index =
+            Some((index + 1).min(self.user_breakpoints.len() - 1));
+        self.scroll_selected_breakpoint_into_view();
+    }
+
+    pub(crate) fn select_previous_user_breakpoint(&mut self) {
+        self.normalize_selected_user_breakpoint();
+        if self.user_breakpoints.is_empty() {
+            return;
+        }
+        let index = self.selected_user_breakpoint_index.unwrap_or(0);
+        self.selected_user_breakpoint_index = Some(index.saturating_sub(1));
+        self.scroll_selected_breakpoint_into_view();
+    }
+
+    pub(crate) fn normalize_selected_user_breakpoint(&mut self) {
+        self.normalize_selected_user_breakpoint_with_previous_id(self.selected_breakpoint_id());
+    }
+
+    fn normalize_selected_user_breakpoint_with_previous_id(
+        &mut self,
+        previous_id: Option<UserBreakpointId>,
+    ) {
+        if self.user_breakpoints.is_empty() {
+            self.selected_user_breakpoint_index = None;
+            self.breakpoint_tab_scroll = 0;
+            return;
+        }
+        if let Some(previous_id) = previous_id {
+            if let Some(index) = self
+                .user_breakpoints
+                .iter()
+                .position(|breakpoint| breakpoint.id == previous_id)
+            {
+                self.selected_user_breakpoint_index = Some(index);
+                self.scroll_selected_breakpoint_into_view();
+                return;
+            }
+        }
+        let fallback = self
+            .selected_user_breakpoint_index
+            .unwrap_or(0)
+            .min(self.user_breakpoints.len() - 1);
+        self.selected_user_breakpoint_index = Some(fallback);
+        self.scroll_selected_breakpoint_into_view();
+    }
+
+    fn scroll_selected_breakpoint_into_view(&mut self) {
+        if let Some(index) = self.selected_user_breakpoint_index {
+            if index < self.breakpoint_tab_scroll {
+                self.breakpoint_tab_scroll = index;
+            } else {
+                let visible_rows = 8usize;
+                let bottom = self.breakpoint_tab_scroll.saturating_add(visible_rows);
+                if index >= bottom {
+                    self.breakpoint_tab_scroll = index.saturating_sub(visible_rows - 1);
+                }
+            }
+        }
     }
 
     pub(crate) fn recenter_code_on_rip(&mut self) {
@@ -786,7 +951,7 @@ impl LiveTuiApp {
             .as_ref()
             .map(format_code_context_lines)?
             .iter()
-            .position(|line| line.starts_with('>'))
+            .position(|line| line.starts_with('>') || line.starts_with("*>"))
     }
 
     pub(crate) fn reset_selection_scrolls(&mut self) {
@@ -839,6 +1004,11 @@ impl LiveTuiApp {
         self.maps_tab_scroll = clamp_scroll(
             self.maps_tab_scroll,
             format_live_maps_tab(self).lines().count(),
+            1,
+        );
+        self.breakpoint_tab_scroll = clamp_scroll(
+            self.breakpoint_tab_scroll,
+            format_live_breakpoints_tab(self).lines().count(),
             1,
         );
         self.chunk_inspector_scroll = clamp_scroll(

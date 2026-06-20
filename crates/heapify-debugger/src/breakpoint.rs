@@ -1,5 +1,50 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UserBreakpointId(pub u64);
+
+impl UserBreakpointId {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserBreakpointSpec {
+    Address(u64),
+    Symbol(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserBreakpoint {
+    pub id: UserBreakpointId,
+    pub spec: UserBreakpointSpec,
+    pub resolved_address: u64,
+    pub enabled: bool,
+    pub hit_count: u64,
+    pub label: String,
+    pub resolved_symbol: Option<String>,
+    pub source: Option<SourceLocation>,
+}
+
+impl UserBreakpoint {
+    pub fn summary_line(&self) -> String {
+        let enabled = if self.enabled { "y" } else { "n" };
+        format!(
+            "{:<4} {:<3} {:<6} 0x{:x} {}",
+            self.id.as_u64(),
+            enabled,
+            self.hit_count,
+            self.resolved_address,
+            self.label
+        )
+    }
+
+    pub fn location_line(&self) -> String {
+        format!("0x{:x} ({})", self.resolved_address, self.label)
+    }
+}
+
 pub struct Breakpoint {
     pub addr: u64,
     pub original_byte: u8,
@@ -80,6 +125,7 @@ pub enum BreakpointPurpose {
     ManagedAllocatorEntry,
     ManagedAllocatorReturn,
     UserInstructionStepOver,
+    UserPersistent,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +134,9 @@ pub enum BreakpointOwner {
     UserInstructionStepOver {
         command_id: LiveCommandId,
         from_rip: u64,
+    },
+    UserPersistent {
+        breakpoint_id: UserBreakpointId,
     },
 }
 
@@ -104,6 +153,7 @@ impl BreakpointOwner {
             BreakpointOwner::UserInstructionStepOver { .. } => {
                 BreakpointPurpose::UserInstructionStepOver
             }
+            BreakpointOwner::UserPersistent { .. } => BreakpointPurpose::UserPersistent,
         }
     }
 }
@@ -113,9 +163,28 @@ pub struct ManagedBreakpoint {
     pub owners: Vec<BreakpointOwner>,
 }
 
+fn is_duplicate_user_persistent_owner(
+    existing: &[BreakpointOwner],
+    owner: &BreakpointOwner,
+) -> bool {
+    let BreakpointOwner::UserPersistent { breakpoint_id } = owner else {
+        return false;
+    };
+    existing.iter().any(|existing_owner| {
+        matches!(
+            existing_owner,
+            BreakpointOwner::UserPersistent {
+                breakpoint_id: existing_id
+            } if existing_id == breakpoint_id
+        )
+    })
+}
+
 #[derive(Default)]
 pub struct BreakpointManager {
     pub(crate) breakpoints: HashMap<u64, ManagedBreakpoint>,
+    user_breakpoints: std::collections::BTreeMap<UserBreakpointId, UserBreakpoint>,
+    next_user_breakpoint_id: u64,
 }
 
 impl BreakpointManager {
@@ -142,6 +211,9 @@ impl BreakpointManager {
 
     fn add_owner(&mut self, pid: Pid, addr: u64, owner: BreakpointOwner) -> Result<()> {
         if let Some(managed) = self.breakpoints.get_mut(&addr) {
+            if is_duplicate_user_persistent_owner(&managed.owners, &owner) {
+                return Ok(());
+            }
             managed.owners.push(owner);
             managed
                 .breakpoint
@@ -163,6 +235,148 @@ impl BreakpointManager {
             },
         );
         Ok(())
+    }
+
+    pub fn add_user_breakpoint(
+        &mut self,
+        pid: Pid,
+        spec: UserBreakpointSpec,
+        resolved_address: u64,
+        label: String,
+        resolved_symbol: Option<String>,
+        source: Option<SourceLocation>,
+    ) -> Result<UserBreakpoint> {
+        let id = UserBreakpointId(self.next_user_breakpoint_id.max(1));
+        self.next_user_breakpoint_id = id.0 + 1;
+        let breakpoint = UserBreakpoint {
+            id,
+            spec,
+            resolved_address,
+            enabled: true,
+            hit_count: 0,
+            label,
+            resolved_symbol,
+            source,
+        };
+        self.user_breakpoints.insert(id, breakpoint.clone());
+        self.add_owner(
+            pid,
+            resolved_address,
+            BreakpointOwner::UserPersistent { breakpoint_id: id },
+        )?;
+        Ok(breakpoint)
+    }
+
+    pub fn list_user_breakpoints(&self) -> Vec<UserBreakpoint> {
+        self.user_breakpoints.values().cloned().collect()
+    }
+
+    pub fn get_user_breakpoint(&self, id: UserBreakpointId) -> Option<&UserBreakpoint> {
+        self.user_breakpoints.get(&id)
+    }
+
+    pub fn enable_user_breakpoint(
+        &mut self,
+        pid: Pid,
+        id: UserBreakpointId,
+    ) -> Result<UserBreakpoint> {
+        let (addr, was_enabled) = {
+            let breakpoint = self
+                .user_breakpoints
+                .get_mut(&id)
+                .with_context(|| format!("unknown breakpoint id {}", id.as_u64()))?;
+            let was_enabled = breakpoint.enabled;
+            breakpoint.enabled = true;
+            (breakpoint.resolved_address, was_enabled)
+        };
+        if !was_enabled {
+            self.add_owner(
+                pid,
+                addr,
+                BreakpointOwner::UserPersistent { breakpoint_id: id },
+            )?;
+        }
+        Ok(self
+            .user_breakpoints
+            .get(&id)
+            .expect("breakpoint exists")
+            .clone())
+    }
+
+    pub fn disable_user_breakpoint(
+        &mut self,
+        pid: Pid,
+        id: UserBreakpointId,
+    ) -> Result<UserBreakpoint> {
+        let (addr, was_enabled) = {
+            let breakpoint = self
+                .user_breakpoints
+                .get_mut(&id)
+                .with_context(|| format!("unknown breakpoint id {}", id.as_u64()))?;
+            let was_enabled = breakpoint.enabled;
+            breakpoint.enabled = false;
+            (breakpoint.resolved_address, was_enabled)
+        };
+        if was_enabled {
+            self.remove_owner_at(pid, addr, |owner| {
+                matches!(owner, BreakpointOwner::UserPersistent { breakpoint_id } if *breakpoint_id == id)
+            })?;
+        }
+        Ok(self
+            .user_breakpoints
+            .get(&id)
+            .expect("breakpoint exists")
+            .clone())
+    }
+
+    pub fn delete_user_breakpoint(
+        &mut self,
+        pid: Pid,
+        id: UserBreakpointId,
+    ) -> Result<UserBreakpoint> {
+        let breakpoint = self
+            .user_breakpoints
+            .remove(&id)
+            .with_context(|| format!("unknown breakpoint id {}", id.as_u64()))?;
+        if breakpoint.enabled {
+            self.remove_owner_at(pid, breakpoint.resolved_address, |owner| {
+                matches!(owner, BreakpointOwner::UserPersistent { breakpoint_id } if *breakpoint_id == id)
+            })?;
+        }
+        Ok(breakpoint)
+    }
+
+    pub fn persistent_user_owners_at(&self, address: u64) -> Vec<UserBreakpointId> {
+        self.breakpoints
+            .get(&address)
+            .map(|managed| {
+                managed
+                    .owners
+                    .iter()
+                    .filter_map(|owner| match owner {
+                        BreakpointOwner::UserPersistent { breakpoint_id } => Some(*breakpoint_id),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_user_breakpoint_hits(
+        &mut self,
+        ids: &[UserBreakpointId],
+    ) -> Vec<UserBreakpoint> {
+        let mut breakpoints = Vec::new();
+        for id in ids {
+            if let Some(breakpoint) = self.user_breakpoints.get_mut(id) {
+                if breakpoint.enabled {
+                    breakpoint.hit_count += 1;
+                    breakpoints.push(breakpoint.clone());
+                }
+            }
+        }
+        breakpoints.sort_by_key(|breakpoint| breakpoint.id);
+        breakpoints
     }
 
     pub fn contains(&self, addr: u64) -> bool {

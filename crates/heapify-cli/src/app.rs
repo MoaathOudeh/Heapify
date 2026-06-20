@@ -58,7 +58,8 @@ use heapify_debugger::{
     LiveCommandId, LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, Pid, ProcessMapEntry,
     ProcessMapsSnapshot, ProcessSymbolizer, RegisterRole, RegisterSnapshot, SourceLocation,
     StackSnapshot, StackWord, StdinConfig, SymbolizedAddress, TargetCommand, TargetSourceMapper,
-    TraceHeapContext, DEFAULT_DISASSEMBLY_AFTER_BYTES, DEFAULT_DISASSEMBLY_BEFORE_BYTES,
+    TraceHeapContext, UserBreakpoint, UserBreakpointId, UserBreakpointSpec,
+    DEFAULT_DISASSEMBLY_AFTER_BYTES, DEFAULT_DISASSEMBLY_BEFORE_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -417,6 +418,33 @@ fn run_trace_heap_worker(
                             snapshot: stack_snapshot,
                         });
                         let _ = sender.send(LiveTraceUpdate::CodeContext { event_id, context });
+                    }
+                    Ok(())
+                },
+                |breakpoints| {
+                    if let Some(sender) = &live_sender {
+                        let _ = sender.send(LiveTraceUpdate::UserBreakpoints { breakpoints });
+                    }
+                    Ok(())
+                },
+                |address, breakpoint_id, pid| {
+                    if let Some(sender) = &live_sender {
+                        let target_symbolizer = target_symbolizer.borrow();
+                        let target_source_mapper = target_source_mapper.borrow();
+                        let context = build_code_context(
+                            pid,
+                            address,
+                            target_symbolizer.as_ref(),
+                            target_source_mapper.as_ref(),
+                        );
+                        let _ = sender.send(LiveTraceUpdate::CodeInspection {
+                            address,
+                            breakpoint_id,
+                        });
+                        let _ = sender.send(LiveTraceUpdate::CodeContext {
+                            event_id: None,
+                            context,
+                        });
                     }
                     Ok(())
                 },
@@ -873,6 +901,7 @@ fn render_live_right_tabs(
         LiveRightTab::Stack,
         LiveRightTab::Logs,
         LiveRightTab::Maps,
+        LiveRightTab::Breakpoints,
     ]
     .into_iter()
     .enumerate()
@@ -903,6 +932,7 @@ fn render_live_right_tab_body(
         LiveRightTab::Stack => render_live_stack_tab(frame, app, area),
         LiveRightTab::Logs => render_live_logs_tab(frame, app, area),
         LiveRightTab::Maps => render_live_maps_tab(frame, app, area),
+        LiveRightTab::Breakpoints => render_live_breakpoints_tab(frame, app, area),
     }
 
     let _ = config;
@@ -1079,6 +1109,37 @@ fn render_live_logs_tab(
     );
 }
 
+fn render_live_breakpoints_tab(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let text = format_live_breakpoints_tab(app);
+    let scroll = clamped_scroll_for_text(
+        &text,
+        app.breakpoint_tab_scroll,
+        area.height.saturating_sub(2) as usize,
+    );
+    let title = format!(
+        "Breakpoints {}",
+        format_scroll_indicator(
+            scroll,
+            text_line_count(&text),
+            area.height.saturating_sub(2) as usize
+        )
+    );
+    frame.render_widget(
+        Paragraph::new(text_from_string(&text))
+            .block(live_tui_block(
+                &title,
+                app.focused_debugger_pane == LiveDebuggerPane::RightTab
+                    && app.active_right_tab == LiveRightTab::Breakpoints,
+            ))
+            .scroll((scroll_offset_u16(scroll), 0)),
+        area,
+    );
+}
+
 fn handle_live_tui_key(
     key: KeyEvent,
     app: &mut LiveTuiApp,
@@ -1096,6 +1157,13 @@ fn handle_live_tui_key(
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         request_live_stop(app, input_closed, control_sender);
+        return false;
+    }
+
+    if app.focused_debugger_pane == LiveDebuggerPane::RightTab
+        && app.active_right_tab == LiveRightTab::Breakpoints
+        && handle_live_breakpoints_tab_key(key, app, control_sender)
+    {
         return false;
     }
 
@@ -1169,12 +1237,16 @@ fn handle_live_tui_key(
         KeyCode::Char('2') => app.set_active_right_tab(LiveRightTab::Stack),
         KeyCode::Char('3') => app.set_active_right_tab(LiveRightTab::Logs),
         KeyCode::Char('4') => app.set_active_right_tab(LiveRightTab::Maps),
+        KeyCode::Char('5') => app.set_active_right_tab(LiveRightTab::Breakpoints),
         KeyCode::Char('[') => app.previous_right_tab(),
         KeyCode::Char(']') => app.next_right_tab(),
         KeyCode::Tab => app.focus_next_pane(),
         KeyCode::BackTab => app.focus_previous_pane(),
         KeyCode::Down | KeyCode::Char('j') => match app.focused_debugger_pane {
             LiveDebuggerPane::Trace => app.select_next(),
+            LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Breakpoints => {
+                app.select_next_user_breakpoint()
+            }
             LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Heap => {
                 app.select_next_chunk()
             }
@@ -1182,6 +1254,9 @@ fn handle_live_tui_key(
         },
         KeyCode::Up | KeyCode::Char('k') => match app.focused_debugger_pane {
             LiveDebuggerPane::Trace => app.select_previous(),
+            LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Breakpoints => {
+                app.select_previous_user_breakpoint()
+            }
             LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Heap => {
                 app.select_previous_chunk()
             }
@@ -1253,6 +1328,106 @@ fn handle_live_tui_console_key(
     }
 }
 
+fn handle_live_breakpoints_tab_key(
+    key: KeyEvent,
+    app: &mut LiveTuiApp,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) -> bool {
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.select_next_user_breakpoint();
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.select_previous_user_breakpoint();
+            true
+        }
+        KeyCode::PageDown => {
+            for _ in 0..10 {
+                app.select_next_user_breakpoint();
+            }
+            true
+        }
+        KeyCode::PageUp => {
+            for _ in 0..10 {
+                app.select_previous_user_breakpoint();
+            }
+            true
+        }
+        KeyCode::Home => {
+            app.selected_user_breakpoint_index = (!app.user_breakpoints.is_empty()).then_some(0);
+            app.breakpoint_tab_scroll = 0;
+            true
+        }
+        KeyCode::End => {
+            app.selected_user_breakpoint_index = app.user_breakpoints.len().checked_sub(1);
+            app.breakpoint_tab_scroll = usize::MAX;
+            true
+        }
+        KeyCode::Enter => {
+            inspect_selected_breakpoint(app, control_sender);
+            true
+        }
+        KeyCode::Char(' ') => {
+            toggle_selected_breakpoint(app, control_sender);
+            true
+        }
+        KeyCode::Char('x') => {
+            delete_selected_breakpoint(app, control_sender);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn inspect_selected_breakpoint(
+    app: &mut LiveTuiApp,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) {
+    let Some(breakpoint) = app.selected_user_breakpoint().cloned() else {
+        return;
+    };
+    app.code_view_address = Some(breakpoint.resolved_address);
+    app.code_view_breakpoint_id = Some(breakpoint.id);
+    app.code_follow_rip = false;
+    app.focused_debugger_pane = LiveDebuggerPane::Code;
+    app.sync_legacy_focus_from_debugger_pane();
+    app.push_log_line(format!("breakpoint {} selected", breakpoint.id.as_u64()));
+    send_live_command(
+        app,
+        control_sender,
+        LiveCommand::InspectCodeAt {
+            address: breakpoint.resolved_address,
+            breakpoint_id: Some(breakpoint.id),
+        },
+    );
+}
+
+fn toggle_selected_breakpoint(
+    app: &mut LiveTuiApp,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) {
+    let Some(breakpoint) = app.selected_user_breakpoint().cloned() else {
+        return;
+    };
+    let command = if breakpoint.enabled {
+        LiveCommand::DisableUserBreakpoint(breakpoint.id)
+    } else {
+        LiveCommand::EnableUserBreakpoint(breakpoint.id)
+    };
+    send_live_command(app, control_sender, command);
+}
+
+fn delete_selected_breakpoint(
+    app: &mut LiveTuiApp,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) {
+    let Some(id) = app.selected_breakpoint_id() else {
+        return;
+    };
+    send_live_command(app, control_sender, LiveCommand::DeleteUserBreakpoint(id));
+}
+
 fn submit_console_input(
     app: &mut LiveTuiApp,
     input_closed: bool,
@@ -1287,7 +1462,7 @@ fn execute_console_command(
     match command {
         ConsoleCommand::Help => {
             app.push_console_output(
-                "commands: help, continue, pause, resume, next, stepi, si, step, nexti, ni, disas, disassemble, stop, regs, stack, maps, heap ADDR, jump ADDR, tab NAME",
+                "commands: help, continue, pause, resume, next, stepi, si, step, nexti, ni, break *ADDR, break SYMBOL, info breaks, delete ID, enable ID, disable ID, disas, disassemble, stop, regs, stack, maps, heap ADDR, jump ADDR, tab NAME; 5 / tab breaks opens breakpoint manager",
             );
         }
         ConsoleCommand::Continue => {
@@ -1333,6 +1508,39 @@ fn execute_console_command(
                 app.push_console_output(status);
             }
         }
+        ConsoleCommand::BreakAddress(addr) => {
+            send_console_live_command(
+                app,
+                control_sender,
+                LiveCommand::AddUserBreakpointAddress(addr),
+            );
+        }
+        ConsoleCommand::BreakSymbol(symbol) => {
+            send_console_live_command(
+                app,
+                control_sender,
+                LiveCommand::AddUserBreakpointSymbol(symbol),
+            );
+        }
+        ConsoleCommand::InfoBreakpoints => {
+            if app.user_breakpoints.is_empty() {
+                app.push_console_output("no breakpoints");
+            } else {
+                app.push_console_output("Num  En  Hits   Address Label");
+                for breakpoint in app.user_breakpoints.clone() {
+                    app.push_console_output(breakpoint.summary_line());
+                }
+            }
+        }
+        ConsoleCommand::DeleteBreakpoint(id) => {
+            send_console_live_command(app, control_sender, LiveCommand::DeleteUserBreakpoint(id));
+        }
+        ConsoleCommand::EnableBreakpoint(id) => {
+            send_console_live_command(app, control_sender, LiveCommand::EnableUserBreakpoint(id));
+        }
+        ConsoleCommand::DisableBreakpoint(id) => {
+            send_console_live_command(app, control_sender, LiveCommand::DisableUserBreakpoint(id));
+        }
         ConsoleCommand::SelectRightTab(tab) => {
             app.set_active_right_tab(tab);
         }
@@ -1377,12 +1585,12 @@ fn send_live_command(
     control_sender: &mpsc::Sender<LiveCommandMessage>,
     command: LiveCommand,
 ) {
-    let Ok(message) = app.prepare_command(command) else {
+    let Ok(message) = app.prepare_command(command.clone()) else {
         return;
     };
 
     if control_sender.send(message).is_err() {
-        app.last_command = Some(command);
+        app.last_command = Some(command.clone());
         app.last_command_status = Some(LiveCommandStatus::Failed);
         app.last_command_message = Some("failed to send command to trace worker".to_string());
         app.status_line = "failed to send command to trace worker".to_string();
@@ -1397,7 +1605,7 @@ fn send_console_live_command(
     control_sender: &mpsc::Sender<LiveCommandMessage>,
     command: LiveCommand,
 ) {
-    let message = match app.prepare_command(command) {
+    let message = match app.prepare_command(command.clone()) {
         Ok(message) => message,
         Err(reason) => {
             app.push_console_output(reason);
@@ -1406,7 +1614,7 @@ fn send_console_live_command(
     };
 
     if control_sender.send(message).is_err() {
-        app.last_command = Some(command);
+        app.last_command = Some(command.clone());
         app.last_command_status = Some(LiveCommandStatus::Failed);
         app.last_command_message = Some("failed to send command to trace worker".to_string());
         app.status_line = "failed to send command to trace worker".to_string();
@@ -1467,6 +1675,15 @@ fn apply_sent_live_command(app: &mut LiveTuiApp, command: LiveCommand) {
             app.status_line = "waiting for next stop...".to_string();
             app.last_command_message = Some("waiting for next stop...".to_string());
         }
+        LiveCommand::AddUserBreakpointAddress(_)
+        | LiveCommand::AddUserBreakpointSymbol(_)
+        | LiveCommand::DeleteUserBreakpoint(_)
+        | LiveCommand::EnableUserBreakpoint(_)
+        | LiveCommand::DisableUserBreakpoint(_)
+        | LiveCommand::InspectCodeAt { .. } => {
+            app.status_line = format!("{} requested...", command.as_str());
+            app.last_command_message = Some(app.status_line.clone());
+        }
     }
 }
 
@@ -1498,11 +1715,12 @@ fn next_live_debugger_pane(current: LiveDebuggerPane, direction: isize) -> LiveD
 }
 
 fn next_live_right_tab(current: LiveRightTab, direction: isize) -> LiveRightTab {
-    const TABS: [LiveRightTab; 4] = [
+    const TABS: [LiveRightTab; 5] = [
         LiveRightTab::Heap,
         LiveRightTab::Stack,
         LiveRightTab::Logs,
         LiveRightTab::Maps,
+        LiveRightTab::Breakpoints,
     ];
     let current_index = TABS.iter().position(|tab| *tab == current).unwrap_or(0) as isize;
     let len = TABS.len() as isize;
@@ -2098,6 +2316,14 @@ pub fn format_source_location(source: Option<&SourceLocation>) -> String {
 }
 
 pub fn format_code_context_lines(context: &CodeContext) -> Vec<String> {
+    format_code_context_lines_with_markers(context, &[], None)
+}
+
+pub fn format_code_context_lines_with_markers(
+    context: &CodeContext,
+    breakpoint_addresses: &[u64],
+    selected_address: Option<u64>,
+) -> Vec<String> {
     let mut lines = vec![
         format!(
             "RIP:     {}",
@@ -2132,11 +2358,15 @@ pub fn format_code_context_lines(context: &CodeContext) -> Vec<String> {
         if disassembly.lines.is_empty() {
             lines.push("disassembly unavailable".to_string());
         } else {
-            lines.extend(disassembly.lines.iter().map(format_disassembly_line));
+            lines.extend(disassembly.lines.iter().map(|line| {
+                format_disassembly_line_with_markers(line, breakpoint_addresses, selected_address)
+            }));
         }
     } else {
+        let has_breakpoint = breakpoint_addresses.contains(&context.instruction_pointer);
+        let marker = disassembly_marker(true, has_breakpoint);
         lines.push(format!(
-            "> {}  <disassembly unavailable>",
+            "{marker} {}  <disassembly unavailable>",
             format_register_value_fixed_hex(context.instruction_pointer)
         ));
     }
@@ -2145,7 +2375,20 @@ pub fn format_code_context_lines(context: &CodeContext) -> Vec<String> {
 }
 
 fn format_disassembly_line(line: &DisassemblyLine) -> String {
-    let marker = if line.is_current { ">" } else { " " };
+    format_disassembly_line_with_markers(line, &[], None)
+}
+
+fn format_disassembly_line_with_markers(
+    line: &DisassemblyLine,
+    breakpoint_addresses: &[u64],
+    selected_address: Option<u64>,
+) -> String {
+    let has_breakpoint = breakpoint_addresses.contains(&line.address);
+    let marker = if selected_address == Some(line.address) && !line.is_current && has_breakpoint {
+        "b"
+    } else {
+        disassembly_marker(line.is_current, has_breakpoint)
+    };
     let bytes = format_instruction_bytes(&line.bytes);
     let mut text = if line.operands.is_empty() {
         line.mnemonic.clone()
@@ -2174,6 +2417,15 @@ fn format_disassembly_line(line: &DisassemblyLine) -> String {
     )
 }
 
+fn disassembly_marker(is_current: bool, has_breakpoint: bool) -> &'static str {
+    match (is_current, has_breakpoint) {
+        (true, true) => "*>",
+        (true, false) => ">",
+        (false, true) => "B",
+        (false, false) => " ",
+    }
+}
+
 fn format_instruction_bytes(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -2200,7 +2452,19 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 fn format_live_code_context(app: &LiveTuiApp) -> String {
     app.latest_code_context
         .as_ref()
-        .map(format_code_context_lines)
+        .map(|context| {
+            let breakpoint_addresses = app
+                .user_breakpoints
+                .iter()
+                .filter(|breakpoint| breakpoint.enabled)
+                .map(|breakpoint| breakpoint.resolved_address)
+                .collect::<Vec<_>>();
+            format_code_context_lines_with_markers(
+                context,
+                &breakpoint_addresses,
+                app.code_view_address,
+            )
+        })
         .map(|lines| lines.join("\n"))
         .unwrap_or_else(|| "code context unavailable".to_string())
 }
@@ -2228,6 +2492,7 @@ fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String 
     if let Some(status) = app.last_command_status {
         let command = app
             .last_command
+            .as_ref()
             .map(LiveCommand::as_str)
             .unwrap_or("target");
         lines.push(format!("{command}: {}", status.as_str()));
@@ -2249,6 +2514,46 @@ fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String 
         lines.push("heapify> press ':' for command".to_string());
     }
     lines.join("\n")
+}
+
+pub fn format_live_breakpoints_tab(app: &LiveTuiApp) -> String {
+    if app.user_breakpoints.is_empty() {
+        return "no user breakpoints; use :break *ADDR or :break SYMBOL".to_string();
+    }
+
+    let mut lines =
+        vec!["   ID State    Address             Location                 Hits".to_string()];
+    for (index, breakpoint) in app.user_breakpoints.iter().enumerate() {
+        let selected = if app.selected_user_breakpoint_index == Some(index) {
+            ">"
+        } else {
+            " "
+        };
+        let state = if breakpoint.enabled {
+            "enabled "
+        } else {
+            "disabled"
+        };
+        lines.push(format!(
+            "{selected} {:<2} {:<8} {}  {:<22} {}",
+            breakpoint.id.as_u64(),
+            state,
+            format_register_value_fixed_hex(breakpoint.resolved_address),
+            breakpoint_label_for_display(breakpoint),
+            breakpoint.hit_count
+        ));
+        if let Some(source) = breakpoint.source.as_ref() {
+            lines.push(format!("     {}", format_source_location(Some(source))));
+        }
+    }
+    lines.join("\n")
+}
+
+fn breakpoint_label_for_display(breakpoint: &UserBreakpoint) -> &str {
+    breakpoint
+        .resolved_symbol
+        .as_deref()
+        .unwrap_or(breakpoint.label.as_str())
 }
 
 fn format_live_logs_pane(app: &LiveTuiApp) -> String {
@@ -2413,6 +2718,22 @@ pub fn parse_console_command(input: &str) -> ConsoleCommand {
         ["disas" | "disassemble"] => ConsoleCommand::Disassemble,
         ["stack"] => ConsoleCommand::Stack,
         ["maps"] => ConsoleCommand::Maps,
+        ["breaks"] => ConsoleCommand::SelectRightTab(LiveRightTab::Breakpoints),
+        ["break" | "b"] => {
+            ConsoleCommand::Unknown("usage: break *ADDR or break SYMBOL".to_string())
+        }
+        ["break" | "b", location] => parse_breakpoint_location(location)
+            .unwrap_or_else(|| ConsoleCommand::Unknown(trimmed.to_string())),
+        ["info", "break" | "breaks"] => ConsoleCommand::InfoBreakpoints,
+        ["delete" | "d", id] => parse_breakpoint_id(id)
+            .map(ConsoleCommand::DeleteBreakpoint)
+            .unwrap_or_else(|| ConsoleCommand::Unknown(trimmed.to_string())),
+        ["enable", id] => parse_breakpoint_id(id)
+            .map(ConsoleCommand::EnableBreakpoint)
+            .unwrap_or_else(|| ConsoleCommand::Unknown(trimmed.to_string())),
+        ["disable", id] => parse_breakpoint_id(id)
+            .map(ConsoleCommand::DisableBreakpoint)
+            .unwrap_or_else(|| ConsoleCommand::Unknown(trimmed.to_string())),
         ["heap", rest @ ..] | ["jump", rest @ ..] => {
             if rest.is_empty() {
                 return ConsoleCommand::Unknown(trimmed.to_string());
@@ -2428,12 +2749,24 @@ pub fn parse_console_command(input: &str) -> ConsoleCommand {
     }
 }
 
+fn parse_breakpoint_location(location: &str) -> Option<ConsoleCommand> {
+    if let Some(addr) = location.strip_prefix('*') {
+        return parse_addr(addr).ok().map(ConsoleCommand::BreakAddress);
+    }
+    (!location.is_empty()).then(|| ConsoleCommand::BreakSymbol(location.to_string()))
+}
+
+fn parse_breakpoint_id(id: &str) -> Option<UserBreakpointId> {
+    id.parse::<u64>().ok().map(UserBreakpointId)
+}
+
 fn parse_console_tab(tab: &str) -> Option<LiveRightTab> {
     match tab {
         "heap" => Some(LiveRightTab::Heap),
         "stack" => Some(LiveRightTab::Stack),
         "logs" => Some(LiveRightTab::Logs),
         "maps" => Some(LiveRightTab::Maps),
+        "breaks" | "breakpoints" => Some(LiveRightTab::Breakpoints),
         _ => None,
     }
 }
@@ -12033,6 +12366,19 @@ mod tests {
         }
     }
 
+    fn test_user_breakpoint(id: u64, address: u64, enabled: bool) -> super::UserBreakpoint {
+        super::UserBreakpoint {
+            id: super::UserBreakpointId(id),
+            spec: super::UserBreakpointSpec::Address(address),
+            resolved_address: address,
+            enabled,
+            hit_count: id * 2,
+            label: format!("main+0x{id:x}"),
+            resolved_symbol: Some(format!("main+0x{id:x}")),
+            source: None,
+        }
+    }
+
     fn test_stack_snapshot(values: &[u64]) -> StackSnapshot {
         StackSnapshot {
             stack_pointer: 0x7fffffffdc30,
@@ -12240,6 +12586,42 @@ mod tests {
 
         assert_eq!(app.latest_code_context, Some(context));
         assert!(app.code_context_by_event_id.is_empty());
+    }
+
+    #[test]
+    fn live_tui_app_applies_code_inspection_metadata() {
+        let mut app = super::LiveTuiApp::default();
+
+        app.apply_update(super::LiveTraceUpdate::CodeInspection {
+            address: 0x4011a5,
+            breakpoint_id: Some(super::UserBreakpointId(1)),
+        });
+
+        assert_eq!(app.code_view_address, Some(0x4011a5));
+        assert_eq!(
+            app.code_view_breakpoint_id,
+            Some(super::UserBreakpointId(1))
+        );
+        assert!(!app.code_follow_rip);
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Code);
+    }
+
+    #[test]
+    fn inspect_code_live_updates_do_not_create_heap_events() {
+        let mut app = super::LiveTuiApp::default();
+        let context = test_code_context(0x4011a5);
+
+        app.apply_update(super::LiveTraceUpdate::CodeInspection {
+            address: 0x4011a5,
+            breakpoint_id: Some(super::UserBreakpointId(1)),
+        });
+        app.apply_update(super::LiveTraceUpdate::CodeContext {
+            event_id: None,
+            context: context.clone(),
+        });
+
+        assert!(app.events.is_empty());
+        assert_eq!(app.latest_code_context, Some(context));
     }
 
     #[test]
@@ -12501,6 +12883,78 @@ mod tests {
     }
 
     #[test]
+    fn breakpoint_selection_is_preserved_by_id_after_refresh() {
+        let mut app = super::LiveTuiApp::default();
+        app.user_breakpoints = vec![
+            test_user_breakpoint(1, 0x401000, true),
+            test_user_breakpoint(2, 0x401010, true),
+        ];
+        app.selected_user_breakpoint_index = Some(1);
+
+        app.apply_update(super::LiveTraceUpdate::UserBreakpoints {
+            breakpoints: vec![
+                test_user_breakpoint(2, 0x401010, false),
+                test_user_breakpoint(1, 0x401000, true),
+            ],
+        });
+
+        assert_eq!(
+            app.selected_breakpoint_id(),
+            Some(super::UserBreakpointId(2))
+        );
+        assert_eq!(app.selected_user_breakpoint_index, Some(0));
+    }
+
+    #[test]
+    fn breakpoint_selection_clamps_when_deleted() {
+        let mut app = super::LiveTuiApp::default();
+        app.user_breakpoints = vec![
+            test_user_breakpoint(1, 0x401000, true),
+            test_user_breakpoint(2, 0x401010, true),
+        ];
+        app.selected_user_breakpoint_index = Some(1);
+
+        app.apply_update(super::LiveTraceUpdate::UserBreakpoints {
+            breakpoints: vec![test_user_breakpoint(1, 0x401000, true)],
+        });
+
+        assert_eq!(
+            app.selected_breakpoint_id(),
+            Some(super::UserBreakpointId(1))
+        );
+        assert_eq!(app.selected_user_breakpoint_index, Some(0));
+    }
+
+    #[test]
+    fn breakpoints_tab_renders_empty_guidance() {
+        let app = super::LiveTuiApp::default();
+
+        assert_eq!(
+            super::format_live_breakpoints_tab(&app),
+            "no user breakpoints; use :break *ADDR or :break SYMBOL"
+        );
+    }
+
+    #[test]
+    fn breakpoints_tab_renders_table_fields_and_state() {
+        let mut app = super::LiveTuiApp::default();
+        app.user_breakpoints = vec![
+            test_user_breakpoint(1, 0x4011a5, true),
+            test_user_breakpoint(2, 0x7ffff7df1234, false),
+        ];
+        app.selected_user_breakpoint_index = Some(0);
+
+        let rendered = super::format_live_breakpoints_tab(&app);
+
+        assert!(rendered.contains("ID State"));
+        assert!(rendered.contains("> 1  enabled"));
+        assert!(rendered.contains("0x00000000004011a5"));
+        assert!(rendered.contains("main+0x1"));
+        assert!(rendered.contains("  2  disabled"));
+        assert!(rendered.contains("0x00007ffff7df1234"));
+    }
+
+    #[test]
     fn live_tui_scrolls_maps_tab() {
         let mut app = super::LiveTuiApp::default();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -12644,6 +13098,8 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         app.focused_debugger_pane = super::LiveDebuggerPane::Code;
         app.code_follow_rip = false;
+        app.code_view_address = Some(0x4011a5);
+        app.code_view_breakpoint_id = Some(super::UserBreakpointId(1));
         app.code_pane_scroll = 99;
         app.latest_code_context = Some(test_code_context(0x4011a5));
         let key = crossterm::event::KeyEvent::new(
@@ -12654,6 +13110,8 @@ mod tests {
         super::handle_live_tui_key(key, &mut app, false, &sender);
 
         assert!(app.code_follow_rip);
+        assert_eq!(app.code_view_address, None);
+        assert_eq!(app.code_view_breakpoint_id, None);
         assert!(app.code_pane_scroll < 99);
         assert!(receiver.try_recv().is_err());
     }
@@ -12709,6 +13167,43 @@ mod tests {
         assert!(rendered.contains("call"));
         assert!(rendered.contains("0x401030"));
         assert!(rendered.contains("<malloc@plt>"));
+    }
+
+    #[test]
+    fn code_marker_rendering_distinguishes_rip_and_breakpoints() {
+        let context = test_code_context(0x4011a5);
+
+        let rip_only =
+            super::format_code_context_lines_with_markers(&context, &[], None).join("\n");
+        let rip_and_breakpoint =
+            super::format_code_context_lines_with_markers(&context, &[0x4011a5], None).join("\n");
+
+        assert!(rip_only.contains("> 0x00000000004011a5"));
+        assert!(rip_and_breakpoint.contains("*> 0x00000000004011a5"));
+    }
+
+    #[test]
+    fn code_marker_rendering_marks_breakpoint_only_and_dedups_addresses() {
+        let mut context = test_code_context(0x4011a5);
+        let disassembly = context.disassembly.as_mut().unwrap();
+        disassembly.lines.push(super::DisassemblyLine {
+            address: 0x4011a6,
+            bytes: vec![0x90],
+            mnemonic: "nop".to_string(),
+            operands: String::new(),
+            text: "nop".to_string(),
+            is_current: false,
+            flow_control: None,
+            target: None,
+            target_annotation: None,
+        });
+
+        let rendered =
+            super::format_code_context_lines_with_markers(&context, &[0x4011a6, 0x4011a6], None)
+                .join("\n");
+
+        assert!(rendered.contains("B 0x00000000004011a6"));
+        assert_eq!(rendered.matches("B 0x00000000004011a6").count(), 1);
     }
 
     #[test]
@@ -12961,6 +13456,7 @@ mod tests {
             ('2', super::LiveRightTab::Stack),
             ('3', super::LiveRightTab::Logs),
             ('4', super::LiveRightTab::Maps),
+            ('5', super::LiveRightTab::Breakpoints),
             ('1', super::LiveRightTab::Heap),
         ] {
             let key = crossterm::event::KeyEvent::new(
@@ -12971,6 +13467,82 @@ mod tests {
             assert_eq!(app.active_right_tab, expected);
             assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::RightTab);
         }
+    }
+
+    #[test]
+    fn enter_on_breakpoint_prepares_inspect_code_and_focuses_code() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.target_status = super::LiveTargetStatus::Paused;
+        app.focused_debugger_pane = super::LiveDebuggerPane::RightTab;
+        app.active_right_tab = super::LiveRightTab::Breakpoints;
+        app.user_breakpoints = vec![test_user_breakpoint(1, 0x4011a5, true)];
+        app.selected_user_breakpoint_index = Some(0);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Code);
+        assert_eq!(app.code_view_address, Some(0x4011a5));
+        assert_eq!(
+            app.code_view_breakpoint_id,
+            Some(super::UserBreakpointId(1))
+        );
+        assert!(!app.code_follow_rip);
+        assert!(matches!(
+            receiver.try_recv().unwrap().command,
+            super::LiveCommand::InspectCodeAt {
+                address: 0x4011a5,
+                breakpoint_id: Some(super::UserBreakpointId(1))
+            }
+        ));
+    }
+
+    #[test]
+    fn space_on_breakpoint_toggles_without_pause_or_resume() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.target_status = super::LiveTargetStatus::Paused;
+        app.focused_debugger_pane = super::LiveDebuggerPane::RightTab;
+        app.active_right_tab = super::LiveRightTab::Breakpoints;
+        app.user_breakpoints = vec![test_user_breakpoint(1, 0x4011a5, true)];
+        app.selected_user_breakpoint_index = Some(0);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(matches!(
+            receiver.try_recv().unwrap().command,
+            super::LiveCommand::DisableUserBreakpoint(super::UserBreakpointId(1))
+        ));
+    }
+
+    #[test]
+    fn x_on_breakpoint_sends_delete_command() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.target_status = super::LiveTargetStatus::Paused;
+        app.focused_debugger_pane = super::LiveDebuggerPane::RightTab;
+        app.active_right_tab = super::LiveRightTab::Breakpoints;
+        app.user_breakpoints = vec![test_user_breakpoint(1, 0x4011a5, true)];
+        app.selected_user_breakpoint_index = Some(0);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert!(matches!(
+            receiver.try_recv().unwrap().command,
+            super::LiveCommand::DeleteUserBreakpoint(super::UserBreakpointId(1))
+        ));
     }
 
     #[test]
@@ -13339,6 +13911,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_console_command_breakpoints() {
+        assert_eq!(
+            super::parse_console_command("break *0x4011a5"),
+            super::ConsoleCommand::BreakAddress(0x4011a5)
+        );
+        assert_eq!(
+            super::parse_console_command("b *0x4011a5"),
+            super::ConsoleCommand::BreakAddress(0x4011a5)
+        );
+        assert_eq!(
+            super::parse_console_command("break main"),
+            super::ConsoleCommand::BreakSymbol("main".to_string())
+        );
+        assert_eq!(
+            super::parse_console_command("b malloc"),
+            super::ConsoleCommand::BreakSymbol("malloc".to_string())
+        );
+        assert_eq!(
+            super::parse_console_command("info break"),
+            super::ConsoleCommand::InfoBreakpoints
+        );
+        assert_eq!(
+            super::parse_console_command("info breaks"),
+            super::ConsoleCommand::InfoBreakpoints
+        );
+        assert_eq!(
+            super::parse_console_command("delete 2"),
+            super::ConsoleCommand::DeleteBreakpoint(super::UserBreakpointId(2))
+        );
+        assert_eq!(
+            super::parse_console_command("d 2"),
+            super::ConsoleCommand::DeleteBreakpoint(super::UserBreakpointId(2))
+        );
+        assert_eq!(
+            super::parse_console_command("enable 2"),
+            super::ConsoleCommand::EnableBreakpoint(super::UserBreakpointId(2))
+        );
+        assert_eq!(
+            super::parse_console_command("disable 2"),
+            super::ConsoleCommand::DisableBreakpoint(super::UserBreakpointId(2))
+        );
+    }
+
+    #[test]
     fn parse_console_command_heap_and_jump_queries() {
         assert_eq!(
             super::parse_console_command("heap 0x1010"),
@@ -13375,6 +13991,18 @@ mod tests {
         assert_eq!(
             super::parse_console_command("tab maps"),
             super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Maps)
+        );
+        assert_eq!(
+            super::parse_console_command("tab breaks"),
+            super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Breakpoints)
+        );
+        assert_eq!(
+            super::parse_console_command("tab breakpoints"),
+            super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Breakpoints)
+        );
+        assert_eq!(
+            super::parse_console_command("breaks"),
+            super::ConsoleCommand::SelectRightTab(super::LiveRightTab::Breakpoints)
         );
     }
 
@@ -14845,6 +15473,8 @@ mod tests {
                 super::LiveTraceUpdate::RegisterSnapshot { .. } => "register_snapshot",
                 super::LiveTraceUpdate::StackSnapshot { .. } => "stack_snapshot",
                 super::LiveTraceUpdate::CodeContext { .. } => "code_context",
+                super::LiveTraceUpdate::CodeInspection { .. } => "code_inspection",
+                super::LiveTraceUpdate::UserBreakpoints { .. } => "user_breakpoints",
                 super::LiveTraceUpdate::BreakMatched(_) => "break_matched",
                 super::LiveTraceUpdate::SessionEnd(_) => "session_end",
             })
@@ -15138,6 +15768,73 @@ mod tests {
         assert!(matches!(
             receiver.try_recv().unwrap(),
             super::LiveTraceUpdate::BreakMatched(super::AllocatorBreakMatch { event_id: 9, .. })
+        ));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn live_tui_sink_does_not_write_user_breakpoints_to_json() {
+        let path = unique_temp_path("heapify-live-user-breakpoints-json");
+        let mut writer = super::JsonWriter::file(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        {
+            let mut sink = super::LiveTuiSink {
+                sender,
+                json_writer: Some(&mut writer),
+            };
+            sink.on_update(&super::LiveTraceUpdate::UserBreakpoints {
+                breakpoints: vec![super::UserBreakpoint {
+                    id: super::UserBreakpointId(1),
+                    spec: super::UserBreakpointSpec::Address(0x4011a5),
+                    resolved_address: 0x4011a5,
+                    enabled: true,
+                    hit_count: 0,
+                    label: "main".to_string(),
+                    resolved_symbol: Some("main".to_string()),
+                    source: None,
+                }],
+            })
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::LiveTraceUpdate::UserBreakpoints { breakpoints } if breakpoints.len() == 1
+        ));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn live_tui_sink_does_not_write_code_inspection_to_json() {
+        let path = unique_temp_path("heapify-live-code-inspection-json");
+        let mut writer = super::JsonWriter::file(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        {
+            let mut sink = super::LiveTuiSink {
+                sender,
+                json_writer: Some(&mut writer),
+            };
+            sink.on_update(&super::LiveTraceUpdate::CodeInspection {
+                address: 0x4011a5,
+                breakpoint_id: Some(super::UserBreakpointId(1)),
+            })
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::LiveTraceUpdate::CodeInspection {
+                address: 0x4011a5,
+                breakpoint_id: Some(super::UserBreakpointId(1))
+            }
         ));
         let contents = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
