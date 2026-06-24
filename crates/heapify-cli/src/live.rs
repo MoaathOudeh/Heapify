@@ -31,6 +31,7 @@ pub struct LiveTuiApp {
     pub latest_stack_snapshot: Option<StackSnapshot>,
     pub stack_snapshots_by_event_id: BTreeMap<usize, StackSnapshot>,
     pub latest_process_maps: Option<ProcessMapsSnapshot>,
+    pub latest_memory_inspection: Option<MemoryInspectionSnapshot>,
     pub user_breakpoints: Vec<UserBreakpoint>,
     pub selected_user_breakpoint_index: Option<usize>,
     pub breakpoint_tab_scroll: usize,
@@ -42,13 +43,19 @@ pub struct LiveTuiApp {
     pub focused_pane: LiveTuiPane,
     pub register_pane_scroll: usize,
     pub code_pane_scroll: usize,
+    pub source_pane_scroll: usize,
     pub code_follow_rip: bool,
+    pub code_pane_mode: CodePaneMode,
     pub event_details_scroll: usize,
     pub heap_layout_scroll: usize,
     pub allocator_scan_scroll: usize,
     pub related_records_scroll: usize,
     pub stack_tab_scroll: usize,
     pub maps_tab_scroll: usize,
+    pub memory_tab_scroll: usize,
+    pub memory_view_format: MemoryViewFormat,
+    pub memory_selected_row: Option<usize>,
+    pub latest_memory_request: Option<MemoryInspectionRequest>,
     pub selected_chunk_index: Option<usize>,
     pub selected_chunk_addr: Option<u64>,
     pub selected_chunk_user_addr: Option<u64>,
@@ -63,6 +70,29 @@ pub struct LiveTuiApp {
     pub console_history_index: Option<usize>,
     pub show_heap_pane: bool,
     pub show_scan_pane: bool,
+}
+
+fn parse_summary_source_location(text: &str) -> Option<SourceLocation> {
+    if text == "unknown" {
+        return Some(SourceLocation {
+            file: None,
+            line: None,
+            column: None,
+        });
+    }
+    if let Some(line) = text.strip_prefix(':') {
+        return Some(SourceLocation {
+            file: None,
+            line: line.parse().ok(),
+            column: None,
+        });
+    }
+    let (file, line) = text.rsplit_once(':')?;
+    Some(SourceLocation {
+        file: Some(file.to_string()),
+        line: line.parse().ok(),
+        column: None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +111,7 @@ pub enum LiveRightTab {
     Logs,
     Maps,
     Breakpoints,
+    Memory,
 }
 
 impl LiveRightTab {
@@ -91,6 +122,7 @@ impl LiveRightTab {
             LiveRightTab::Logs => "logs",
             LiveRightTab::Maps => "maps",
             LiveRightTab::Breakpoints => "breaks",
+            LiveRightTab::Memory => "memory",
         }
     }
 }
@@ -112,7 +144,31 @@ pub struct CodeContext {
     pub symbol_offset: Option<u64>,
     pub object: Option<String>,
     pub source: Option<SourceLocation>,
+    pub source_context: Option<SourceContext>,
     pub disassembly: Option<DisassemblySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceContext {
+    pub path: String,
+    pub line: u64,
+    pub column: Option<u64>,
+    pub lines: Vec<SourceLine>,
+    pub truncated: bool,
+    pub read_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLine {
+    pub number: u64,
+    pub text: String,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodePaneMode {
+    Disassembly,
+    Source,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +213,28 @@ pub struct AddressClassification {
     pub symbol: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInspectionSnapshot {
+    pub requested_address: u64,
+    pub region_start: Option<u64>,
+    pub region_end: Option<u64>,
+    pub permissions: Option<String>,
+    pub region_label: Option<String>,
+    pub classification: AddressClassification,
+    pub rows: Vec<MemoryInspectionRow>,
+    pub truncated: bool,
+    pub read_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInspectionRow {
+    pub address: u64,
+    pub bytes: Vec<u8>,
+    pub word_value: Option<u64>,
+    pub ascii: Option<String>,
+    pub annotation: Option<String>,
+}
+
 impl AddressClassification {
     pub(crate) fn short_label(&self) -> &str {
         &self.label
@@ -188,14 +266,19 @@ pub enum ConsoleCommand {
     NextAllocatorEvent,
     StepInstruction,
     StepInstructionOver,
+    SourceStep,
+    SourceStepOver,
     Stop,
     Registers,
     Disassemble,
+    Source,
     Stack,
     Maps,
     HeapJump(HeapSearchQuery),
+    InspectMemory(MemoryInspectionRequest),
     BreakAddress(u64),
     BreakSymbol(String),
+    BreakSourceLine { path: String, line: u64 },
     InfoBreakpoints,
     DeleteBreakpoint(UserBreakpointId),
     EnableBreakpoint(UserBreakpointId),
@@ -245,6 +328,7 @@ impl Default for LiveTuiApp {
             latest_stack_snapshot: None,
             stack_snapshots_by_event_id: BTreeMap::new(),
             latest_process_maps: None,
+            latest_memory_inspection: None,
             user_breakpoints: Vec::new(),
             selected_user_breakpoint_index: None,
             breakpoint_tab_scroll: 0,
@@ -256,13 +340,19 @@ impl Default for LiveTuiApp {
             focused_pane: LiveTuiPane::Events,
             register_pane_scroll: 0,
             code_pane_scroll: 0,
+            source_pane_scroll: 0,
             code_follow_rip: true,
+            code_pane_mode: CodePaneMode::Disassembly,
             event_details_scroll: 0,
             heap_layout_scroll: 0,
             allocator_scan_scroll: 0,
             related_records_scroll: 0,
             stack_tab_scroll: 0,
             maps_tab_scroll: 0,
+            memory_tab_scroll: 0,
+            memory_view_format: MemoryViewFormat::HexWords,
+            memory_selected_row: None,
+            latest_memory_request: None,
             selected_chunk_index: None,
             selected_chunk_addr: None,
             selected_chunk_user_addr: None,
@@ -335,6 +425,39 @@ impl LiveTuiApp {
             }
             LiveTraceUpdate::ProcessMaps { snapshot } => {
                 self.latest_process_maps = Some(snapshot);
+            }
+            LiveTraceUpdate::MemoryInspection { snapshot } => {
+                self.latest_memory_request = Some(MemoryInspectionRequest {
+                    address: snapshot.requested_address,
+                    count: match snapshot.rows.first() {
+                        Some(row) if row.word_value.is_some() => snapshot.rows.len().max(1),
+                        _ => snapshot
+                            .rows
+                            .iter()
+                            .map(|row| row.bytes.len())
+                            .sum::<usize>()
+                            .max(1),
+                    },
+                    format: if snapshot
+                        .rows
+                        .first()
+                        .and_then(|row| row.word_value)
+                        .is_some()
+                    {
+                        MemoryViewFormat::HexWords
+                    } else {
+                        MemoryViewFormat::HexBytes
+                    },
+                });
+                self.latest_memory_inspection = Some(snapshot);
+                self.active_right_tab = LiveRightTab::Memory;
+                self.focused_debugger_pane = LiveDebuggerPane::RightTab;
+                self.memory_selected_row = self
+                    .latest_memory_inspection
+                    .as_ref()
+                    .and_then(|snapshot| (!snapshot.rows.is_empty()).then_some(0));
+                self.memory_tab_scroll = 0;
+                self.sync_legacy_focus_from_debugger_pane();
             }
             LiveTraceUpdate::RegisterSnapshot { event_id, snapshot } => {
                 let previous = self.latest_register_snapshot.clone();
@@ -630,6 +753,24 @@ impl LiveTuiApp {
                     DebuggerStopReason::InstructionStepOver { from_rip, to_rip }
                 })
             }
+            (Some(LiveCommand::SourceStep), LiveCommandStatus::Completed) => {
+                Self::parse_source_transition(message).map(|(from, to, instructions_executed)| {
+                    DebuggerStopReason::SourceStep {
+                        from,
+                        to,
+                        instructions_executed,
+                    }
+                })
+            }
+            (Some(LiveCommand::SourceStepOver), LiveCommandStatus::Completed) => {
+                Self::parse_source_transition(message).map(|(from, to, instructions_executed)| {
+                    DebuggerStopReason::SourceStepOver {
+                        from,
+                        to,
+                        instructions_executed,
+                    }
+                })
+            }
             (
                 Some(LiveCommand::StepInstruction | LiveCommand::StepInstructionOver),
                 LiveCommandStatus::Failed,
@@ -643,6 +784,24 @@ impl LiveTuiApp {
             }
             _ => None,
         }
+    }
+
+    fn parse_source_transition(message: &str) -> Option<(SourceLocation, SourceLocation, u64)> {
+        let (_, rest) = message.split_once(": ")?;
+        let (from, rest) = rest.split_once(" -> ")?;
+        let (to, rest) = rest.split_once(" after ")?;
+        let instructions = rest.strip_suffix(" instructions")?.parse().ok()?;
+        let from = parse_summary_source_location(from)?;
+        let to = if to.starts_with(':') {
+            SourceLocation {
+                file: from.file.clone(),
+                line: to.strip_prefix(':')?.parse().ok(),
+                column: None,
+            }
+        } else {
+            parse_summary_source_location(to)?
+        };
+        Some((from, to, instructions))
     }
 
     fn parse_user_breakpoint_hit(message: &str) -> Option<DebuggerStopReason> {
@@ -736,7 +895,14 @@ impl LiveTuiApp {
             LiveDebuggerPane::Trace => {}
             LiveDebuggerPane::Code => {
                 self.code_follow_rip = false;
-                self.code_pane_scroll = scroll_delta(self.code_pane_scroll, amount);
+                match self.code_pane_mode {
+                    CodePaneMode::Disassembly => {
+                        self.code_pane_scroll = scroll_delta(self.code_pane_scroll, amount)
+                    }
+                    CodePaneMode::Source => {
+                        self.source_pane_scroll = scroll_delta(self.source_pane_scroll, amount)
+                    }
+                }
             }
             LiveDebuggerPane::RightTab => match self.active_right_tab {
                 LiveRightTab::Heap => {
@@ -759,6 +925,9 @@ impl LiveTuiApp {
                 LiveRightTab::Breakpoints => {
                     self.breakpoint_tab_scroll = scroll_delta(self.breakpoint_tab_scroll, amount);
                 }
+                LiveRightTab::Memory => {
+                    self.memory_tab_scroll = scroll_delta(self.memory_tab_scroll, amount);
+                }
             },
             LiveDebuggerPane::Console => {}
         }
@@ -770,7 +939,10 @@ impl LiveTuiApp {
             LiveDebuggerPane::Trace => self.select_first(),
             LiveDebuggerPane::Code => {
                 self.code_follow_rip = false;
-                self.code_pane_scroll = 0;
+                match self.code_pane_mode {
+                    CodePaneMode::Disassembly => self.code_pane_scroll = 0,
+                    CodePaneMode::Source => self.source_pane_scroll = 0,
+                }
             }
             LiveDebuggerPane::RightTab => match self.active_right_tab {
                 LiveRightTab::Heap => {
@@ -781,6 +953,13 @@ impl LiveTuiApp {
                 LiveRightTab::Logs => self.related_records_scroll = 0,
                 LiveRightTab::Stack => self.stack_tab_scroll = 0,
                 LiveRightTab::Maps => self.maps_tab_scroll = 0,
+                LiveRightTab::Memory => {
+                    self.memory_tab_scroll = 0;
+                    self.memory_selected_row = self
+                        .latest_memory_inspection
+                        .as_ref()
+                        .and_then(|snapshot| (!snapshot.rows.is_empty()).then_some(0));
+                }
                 LiveRightTab::Breakpoints => {
                     self.breakpoint_tab_scroll = 0;
                     self.selected_user_breakpoint_index =
@@ -797,7 +976,10 @@ impl LiveTuiApp {
             LiveDebuggerPane::Trace => self.select_latest(),
             LiveDebuggerPane::Code => {
                 self.code_follow_rip = false;
-                self.code_pane_scroll = usize::MAX;
+                match self.code_pane_mode {
+                    CodePaneMode::Disassembly => self.code_pane_scroll = usize::MAX,
+                    CodePaneMode::Source => self.source_pane_scroll = usize::MAX,
+                }
             }
             LiveDebuggerPane::RightTab => match self.active_right_tab {
                 LiveRightTab::Heap => {
@@ -808,6 +990,13 @@ impl LiveTuiApp {
                 LiveRightTab::Logs => self.related_records_scroll = usize::MAX,
                 LiveRightTab::Stack => self.stack_tab_scroll = usize::MAX,
                 LiveRightTab::Maps => self.maps_tab_scroll = usize::MAX,
+                LiveRightTab::Memory => {
+                    self.memory_tab_scroll = usize::MAX;
+                    self.memory_selected_row = self
+                        .latest_memory_inspection
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.rows.len().checked_sub(1));
+                }
                 LiveRightTab::Breakpoints => {
                     self.breakpoint_tab_scroll = usize::MAX;
                     self.selected_user_breakpoint_index =
@@ -827,9 +1016,10 @@ impl LiveTuiApp {
             LiveDebuggerPane::RightTab => match self.active_right_tab {
                 LiveRightTab::Heap => LiveTuiPane::HeapLayout,
                 LiveRightTab::Logs => LiveTuiPane::RelatedRecords,
-                LiveRightTab::Stack | LiveRightTab::Maps | LiveRightTab::Breakpoints => {
-                    LiveTuiPane::Events
-                }
+                LiveRightTab::Stack
+                | LiveRightTab::Maps
+                | LiveRightTab::Breakpoints
+                | LiveRightTab::Memory => LiveTuiPane::Events,
             },
         };
     }
@@ -852,12 +1042,64 @@ impl LiveTuiApp {
         self.sync_legacy_focus_from_debugger_pane();
     }
 
+    pub(crate) fn normalize_memory_selection(&mut self) {
+        let len = self
+            .latest_memory_inspection
+            .as_ref()
+            .map(|snapshot| snapshot.rows.len())
+            .unwrap_or(0);
+        self.memory_selected_row = if len == 0 {
+            None
+        } else {
+            Some(self.memory_selected_row.unwrap_or(0).min(len - 1))
+        };
+    }
+
+    pub(crate) fn select_next_memory_row(&mut self) {
+        self.normalize_memory_selection();
+        if let Some(index) = self.memory_selected_row {
+            let len = self
+                .latest_memory_inspection
+                .as_ref()
+                .map(|snapshot| snapshot.rows.len())
+                .unwrap_or(0);
+            self.memory_selected_row = Some((index + 1).min(len.saturating_sub(1)));
+            self.memory_tab_scroll = self.memory_selected_row.unwrap_or(0).saturating_sub(3);
+        }
+    }
+
+    pub(crate) fn select_previous_memory_row(&mut self) {
+        self.normalize_memory_selection();
+        if let Some(index) = self.memory_selected_row {
+            self.memory_selected_row = Some(index.saturating_sub(1));
+            self.memory_tab_scroll = self.memory_selected_row.unwrap_or(0).saturating_sub(3);
+        }
+    }
+
+    pub(crate) fn memory_selected_value(&self) -> Option<u64> {
+        let snapshot = self.latest_memory_inspection.as_ref()?;
+        let row = snapshot.rows.get(self.memory_selected_row?)?;
+        let value = row.word_value?;
+        let maps = self.latest_process_maps.as_ref()?;
+        maps.entries
+            .iter()
+            .any(|entry| value >= entry.start && value < entry.end)
+            .then_some(value)
+    }
+
     pub(crate) fn focus_code_and_recenter(&mut self) {
         self.focused_debugger_pane = LiveDebuggerPane::Code;
         self.sync_legacy_focus_from_debugger_pane();
         self.code_view_address = None;
         self.code_view_breakpoint_id = None;
         self.code_follow_rip = true;
+        self.recenter_code_on_rip();
+    }
+
+    pub(crate) fn focus_code_source(&mut self) {
+        self.focused_debugger_pane = LiveDebuggerPane::Code;
+        self.sync_legacy_focus_from_debugger_pane();
+        self.code_pane_mode = CodePaneMode::Source;
         self.recenter_code_on_rip();
     }
 
@@ -944,6 +1186,9 @@ impl LiveTuiApp {
             return;
         };
         self.code_pane_scroll = current_line.saturating_sub(4);
+        if let Some(current_line) = self.current_source_render_line_index() {
+            self.source_pane_scroll = current_line.saturating_sub(4);
+        }
     }
 
     pub(crate) fn current_code_render_line_index(&self) -> Option<usize> {
@@ -952,6 +1197,14 @@ impl LiveTuiApp {
             .map(format_code_context_lines)?
             .iter()
             .position(|line| line.starts_with('>') || line.starts_with("*>"))
+    }
+
+    pub(crate) fn current_source_render_line_index(&self) -> Option<usize> {
+        self.latest_code_context
+            .as_ref()
+            .map(format_source_context_lines)?
+            .iter()
+            .position(|line| line.starts_with(" >"))
     }
 
     pub(crate) fn reset_selection_scrolls(&mut self) {
@@ -967,7 +1220,12 @@ impl LiveTuiApp {
         );
         self.code_pane_scroll = clamp_scroll(
             self.code_pane_scroll,
-            format_live_code_context(self).lines().count(),
+            format_live_code_context_disassembly(self).lines().count(),
+            1,
+        );
+        self.source_pane_scroll = clamp_scroll(
+            self.source_pane_scroll,
+            format_live_code_context_source(self).lines().count(),
             1,
         );
         self.event_details_scroll = clamp_scroll(
@@ -1011,6 +1269,12 @@ impl LiveTuiApp {
             format_live_breakpoints_tab(self).lines().count(),
             1,
         );
+        self.memory_tab_scroll = clamp_scroll(
+            self.memory_tab_scroll,
+            format_live_memory_tab(self).lines().count(),
+            1,
+        );
+        self.normalize_memory_selection();
         self.chunk_inspector_scroll = clamp_scroll(
             self.chunk_inspector_scroll,
             live_chunk_inspector_text(self).lines().count(),

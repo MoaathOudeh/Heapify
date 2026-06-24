@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::live::MemoryInspectionSnapshot;
 
 pub(crate) struct JsonWriter {
     pub(crate) writer: Box<dyn Write>,
@@ -100,6 +101,9 @@ pub enum LiveTraceUpdate {
         address: u64,
         breakpoint_id: Option<UserBreakpointId>,
     },
+    MemoryInspection {
+        snapshot: MemoryInspectionSnapshot,
+    },
     UserBreakpoints {
         breakpoints: Vec<UserBreakpoint>,
     },
@@ -164,6 +168,7 @@ impl LiveTraceSink for CurrentOutputSink<'_> {
             | LiveTraceUpdate::StackSnapshot { .. }
             | LiveTraceUpdate::CodeContext { .. }
             | LiveTraceUpdate::CodeInspection { .. }
+            | LiveTraceUpdate::MemoryInspection { .. }
             | LiveTraceUpdate::UserBreakpoints { .. } => {}
             LiveTraceUpdate::BreakMatched(break_match) => {
                 if self.json_writer.is_none() {
@@ -248,6 +253,7 @@ pub(crate) fn write_live_update_json(
         | LiveTraceUpdate::StackSnapshot { .. }
         | LiveTraceUpdate::CodeContext { .. }
         | LiveTraceUpdate::CodeInspection { .. }
+        | LiveTraceUpdate::MemoryInspection { .. }
         | LiveTraceUpdate::UserBreakpoints { .. }
         | LiveTraceUpdate::BreakMatched(_) => {}
         LiveTraceUpdate::SessionEnd(session) => {

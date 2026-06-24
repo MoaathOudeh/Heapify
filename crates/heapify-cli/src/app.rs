@@ -53,13 +53,15 @@ use heapify_core::tracker::{
 };
 use heapify_core::HeapTraceEvent;
 use heapify_debugger::{
-    read_disassembly_snapshot, validate_live_command, AllocationTraceMode, AllocatorEventControl,
-    DebuggerStopReason, DisassemblyFlowControl, DisassemblyLine, DisassemblySnapshot, LiveCommand,
-    LiveCommandId, LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, Pid, ProcessMapEntry,
-    ProcessMapsSnapshot, ProcessSymbolizer, RegisterRole, RegisterSnapshot, SourceLocation,
-    StackSnapshot, StackWord, StdinConfig, SymbolizedAddress, TargetCommand, TargetSourceMapper,
-    TraceHeapContext, UserBreakpoint, UserBreakpointId, UserBreakpointSpec,
-    DEFAULT_DISASSEMBLY_AFTER_BYTES, DEFAULT_DISASSEMBLY_BEFORE_BYTES,
+    read_disassembly_snapshot, read_process_maps_snapshot, read_target_memory,
+    validate_live_command, AllocationTraceMode, AllocatorEventControl, DebuggerStopReason,
+    DisassemblyFlowControl, DisassemblyLine, DisassemblySnapshot, LiveCommand, LiveCommandId,
+    LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, MemoryInspectionRequest,
+    MemoryViewFormat, Pid, ProcessMapEntry, ProcessMapsSnapshot, ProcessSymbolizer, RegisterRole,
+    RegisterSnapshot, SourceBreakpointResolution, SourceLocation, StackSnapshot, StackWord,
+    StdinConfig, SymbolizedAddress, TargetCommand, TargetSourceMapper, TraceHeapContext,
+    UserBreakpoint, UserBreakpointId, UserBreakpointSpec, DEFAULT_DISASSEMBLY_AFTER_BYTES,
+    DEFAULT_DISASSEMBLY_BEFORE_BYTES,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -88,9 +90,10 @@ use trace::{
 #[path = "live.rs"]
 mod live;
 use live::{
-    AddressClassification, AddressRegionKind, CodeContext, ConsoleCommand, HeapAddressDetail,
-    HeapSearchMode, HeapSearchQuery, LiveDebuggerPane, LiveRightTab, LiveTuiApp, LiveTuiPane,
-    RenderedRegisterLine,
+    AddressClassification, AddressRegionKind, CodeContext, CodePaneMode, ConsoleCommand,
+    HeapAddressDetail, HeapSearchMode, HeapSearchQuery, LiveDebuggerPane, LiveRightTab, LiveTuiApp,
+    LiveTuiPane, MemoryInspectionRow, MemoryInspectionSnapshot, RenderedRegisterLine,
+    SourceContext, SourceLine,
 };
 
 #[path = "replay.rs"]
@@ -445,6 +448,14 @@ fn run_trace_heap_worker(
                             event_id: None,
                             context,
                         });
+                    }
+                    Ok(())
+                },
+                |request, pid| {
+                    if let Some(sender) = &live_sender {
+                        let maps = read_process_maps_snapshot(pid)?;
+                        let snapshot = inspect_memory(pid, &request, &maps, None);
+                        let _ = sender.send(LiveTraceUpdate::MemoryInspection { snapshot });
                     }
                     Ok(())
                 },
@@ -828,13 +839,18 @@ fn render_live_code_pane(
     area: ratatui::layout::Rect,
 ) {
     let details_text = format_live_code_context(app);
+    let requested_scroll = match app.code_pane_mode {
+        CodePaneMode::Disassembly => app.code_pane_scroll,
+        CodePaneMode::Source => app.source_pane_scroll,
+    };
     let details_scroll = clamped_scroll_for_text(
         &details_text,
-        app.code_pane_scroll,
+        requested_scroll,
         area.height.saturating_sub(2) as usize,
     );
     let details_title = format!(
-        "Code {}",
+        "Code {:?} {}",
+        app.code_pane_mode,
         format_scroll_indicator(
             details_scroll,
             text_line_count(&details_text),
@@ -902,6 +918,7 @@ fn render_live_right_tabs(
         LiveRightTab::Logs,
         LiveRightTab::Maps,
         LiveRightTab::Breakpoints,
+        LiveRightTab::Memory,
     ]
     .into_iter()
     .enumerate()
@@ -933,9 +950,33 @@ fn render_live_right_tab_body(
         LiveRightTab::Logs => render_live_logs_tab(frame, app, area),
         LiveRightTab::Maps => render_live_maps_tab(frame, app, area),
         LiveRightTab::Breakpoints => render_live_breakpoints_tab(frame, app, area),
+        LiveRightTab::Memory => render_live_memory_tab(frame, app, area),
     }
 
     let _ = config;
+}
+
+fn render_live_memory_tab(
+    frame: &mut ratatui::Frame<'_>,
+    app: &LiveTuiApp,
+    area: ratatui::layout::Rect,
+) {
+    let text = format_live_memory_tab(app);
+    let scroll = clamped_scroll_for_text(
+        &text,
+        app.memory_tab_scroll,
+        area.height.saturating_sub(2) as usize,
+    );
+    frame.render_widget(
+        Paragraph::new(text_from_string(&text))
+            .block(live_tui_block(
+                "Memory",
+                app.focused_debugger_pane == LiveDebuggerPane::RightTab
+                    && app.active_right_tab == LiveRightTab::Memory,
+            ))
+            .scroll((scroll_offset_u16(scroll), 0)),
+        area,
+    );
 }
 
 fn render_live_maps_tab(
@@ -1166,6 +1207,12 @@ fn handle_live_tui_key(
     {
         return false;
     }
+    if app.focused_debugger_pane == LiveDebuggerPane::RightTab
+        && app.active_right_tab == LiveRightTab::Memory
+        && handle_live_memory_tab_key(key, app, control_sender)
+    {
+        return false;
+    }
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
@@ -1182,6 +1229,12 @@ fn handle_live_tui_key(
         }
         KeyCode::Char('n') => {
             send_live_command(app, control_sender, LiveCommand::StepAllocatorEvent);
+        }
+        KeyCode::Char('S') => {
+            send_live_command(app, control_sender, LiveCommand::SourceStep);
+        }
+        KeyCode::Char('N') => {
+            send_live_command(app, control_sender, LiveCommand::SourceStepOver);
         }
         KeyCode::Char('.') => {
             send_live_command(app, control_sender, LiveCommand::StepInstruction);
@@ -1203,6 +1256,8 @@ fn handle_live_tui_key(
             | LiveTargetStatus::SteppingToNextAllocatorEvent
             | LiveTargetStatus::SteppingInstruction
             | LiveTargetStatus::SteppingInstructionOver
+            | LiveTargetStatus::SourceStepping
+            | LiveTargetStatus::SourceSteppingOver
             | LiveTargetStatus::Stopping
             | LiveTargetStatus::Exited => {}
         },
@@ -1233,11 +1288,18 @@ fn handle_live_tui_key(
         KeyCode::Char('d') if app.focused_debugger_pane == LiveDebuggerPane::Code => {
             app.focus_code_and_recenter();
         }
+        KeyCode::Char('v') if app.focused_debugger_pane == LiveDebuggerPane::Code => {
+            app.code_pane_mode = match app.code_pane_mode {
+                CodePaneMode::Disassembly => CodePaneMode::Source,
+                CodePaneMode::Source => CodePaneMode::Disassembly,
+            };
+        }
         KeyCode::Char('1') => app.set_active_right_tab(LiveRightTab::Heap),
         KeyCode::Char('2') => app.set_active_right_tab(LiveRightTab::Stack),
         KeyCode::Char('3') => app.set_active_right_tab(LiveRightTab::Logs),
         KeyCode::Char('4') => app.set_active_right_tab(LiveRightTab::Maps),
         KeyCode::Char('5') => app.set_active_right_tab(LiveRightTab::Breakpoints),
+        KeyCode::Char('6') => app.set_active_right_tab(LiveRightTab::Memory),
         KeyCode::Char('[') => app.previous_right_tab(),
         KeyCode::Char(']') => app.next_right_tab(),
         KeyCode::Tab => app.focus_next_pane(),
@@ -1246,6 +1308,9 @@ fn handle_live_tui_key(
             LiveDebuggerPane::Trace => app.select_next(),
             LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Breakpoints => {
                 app.select_next_user_breakpoint()
+            }
+            LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Memory => {
+                app.select_next_memory_row()
             }
             LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Heap => {
                 app.select_next_chunk()
@@ -1256,6 +1321,9 @@ fn handle_live_tui_key(
             LiveDebuggerPane::Trace => app.select_previous(),
             LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Breakpoints => {
                 app.select_previous_user_breakpoint()
+            }
+            LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Memory => {
+                app.select_previous_memory_row()
             }
             LiveDebuggerPane::RightTab if app.active_right_tab == LiveRightTab::Heap => {
                 app.select_previous_chunk()
@@ -1269,6 +1337,10 @@ fn handle_live_tui_key(
                 app.select_chunk_at_current_layout_index();
                 app.show_chunk_inspector = true;
                 app.chunk_inspector_scroll = 0;
+            } else if app.focused_debugger_pane == LiveDebuggerPane::RightTab
+                && app.active_right_tab == LiveRightTab::Memory
+            {
+                inspect_selected_memory_pointer(app, control_sender);
             }
         }
         KeyCode::PageDown => {
@@ -1380,6 +1452,90 @@ fn handle_live_breakpoints_tab_key(
     }
 }
 
+fn handle_live_memory_tab_key(
+    key: KeyEvent,
+    app: &mut LiveTuiApp,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) -> bool {
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.select_next_memory_row();
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.select_previous_memory_row();
+            true
+        }
+        KeyCode::PageDown => {
+            for _ in 0..10 {
+                app.select_next_memory_row();
+            }
+            true
+        }
+        KeyCode::PageUp => {
+            for _ in 0..10 {
+                app.select_previous_memory_row();
+            }
+            true
+        }
+        KeyCode::Home => {
+            app.memory_selected_row = app
+                .latest_memory_inspection
+                .as_ref()
+                .and_then(|snapshot| (!snapshot.rows.is_empty()).then_some(0));
+            app.memory_tab_scroll = 0;
+            true
+        }
+        KeyCode::End => {
+            app.memory_selected_row = app
+                .latest_memory_inspection
+                .as_ref()
+                .and_then(|snapshot| snapshot.rows.len().checked_sub(1));
+            app.memory_tab_scroll = usize::MAX;
+            true
+        }
+        KeyCode::Enter => {
+            inspect_selected_memory_pointer(app, control_sender);
+            true
+        }
+        KeyCode::Char('w') => {
+            app.memory_view_format = match app.memory_view_format {
+                MemoryViewFormat::HexWords => MemoryViewFormat::HexBytes,
+                MemoryViewFormat::HexBytes => MemoryViewFormat::HexWords,
+            };
+            if let Some(mut request) = app.latest_memory_request.clone() {
+                request.format = app.memory_view_format;
+                request.count = memory_count_or_default(app.memory_view_format, None);
+                send_live_command(app, control_sender, LiveCommand::InspectMemory(request));
+            }
+            true
+        }
+        KeyCode::Char('g') => {
+            app.console_input_active = true;
+            app.console_input = "mem ".to_string();
+            app.status_line = "mem> address".to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn inspect_selected_memory_pointer(
+    app: &mut LiveTuiApp,
+    control_sender: &mpsc::Sender<LiveCommandMessage>,
+) {
+    let Some(address) = app.memory_selected_value() else {
+        app.status_line = "selected word is not a mapped pointer".to_string();
+        return;
+    };
+    let request = MemoryInspectionRequest {
+        address,
+        count: memory_count_or_default(app.memory_view_format, None),
+        format: app.memory_view_format,
+    };
+    send_live_command(app, control_sender, LiveCommand::InspectMemory(request));
+}
+
 fn inspect_selected_breakpoint(
     app: &mut LiveTuiApp,
     control_sender: &mpsc::Sender<LiveCommandMessage>,
@@ -1390,6 +1546,9 @@ fn inspect_selected_breakpoint(
     app.code_view_address = Some(breakpoint.resolved_address);
     app.code_view_breakpoint_id = Some(breakpoint.id);
     app.code_follow_rip = false;
+    if breakpoint.source.is_some() || breakpoint.source_resolution.is_some() {
+        app.code_pane_mode = CodePaneMode::Source;
+    }
     app.focused_debugger_pane = LiveDebuggerPane::Code;
     app.sync_legacy_focus_from_debugger_pane();
     app.push_log_line(format!("breakpoint {} selected", breakpoint.id.as_u64()));
@@ -1445,7 +1604,7 @@ fn submit_console_input(
     app.push_console_output(format!("heapify> {input}"));
     execute_console_command(
         app,
-        parse_console_command(&input),
+        parse_console_command_for_app(&input, app),
         &input,
         input_closed,
         control_sender,
@@ -1462,7 +1621,7 @@ fn execute_console_command(
     match command {
         ConsoleCommand::Help => {
             app.push_console_output(
-                "commands: help, continue, pause, resume, next, stepi, si, step, nexti, ni, break *ADDR, break SYMBOL, info breaks, delete ID, enable ID, disable ID, disas, disassemble, stop, regs, stack, maps, heap ADDR, jump ADDR, tab NAME; 5 / tab breaks opens breakpoint manager",
+                "commands: help, continue, pause, resume, source-step, ss, source-next, sn, stepi, si, nexti, ni, next, n, break *ADDR, break SYMBOL, break FILE:LINE, info breaks, delete ID, enable ID, disable ID, disas, source, list, stop, regs, stack, maps, heap ADDR, jump ADDR, tab NAME; 5 / tab breaks opens breakpoint manager",
             );
         }
         ConsoleCommand::Continue => {
@@ -1483,6 +1642,12 @@ fn execute_console_command(
         ConsoleCommand::StepInstructionOver => {
             send_console_live_command(app, control_sender, LiveCommand::StepInstructionOver);
         }
+        ConsoleCommand::SourceStep => {
+            send_console_live_command(app, control_sender, LiveCommand::SourceStep);
+        }
+        ConsoleCommand::SourceStepOver => {
+            send_console_live_command(app, control_sender, LiveCommand::SourceStepOver);
+        }
         ConsoleCommand::Stop => {
             if app.session_end.is_some() || input_closed {
                 return true;
@@ -1496,6 +1661,9 @@ fn execute_console_command(
         ConsoleCommand::Disassemble => {
             app.focus_code_and_recenter();
         }
+        ConsoleCommand::Source => {
+            app.focus_code_source();
+        }
         ConsoleCommand::Stack => {
             app.set_active_right_tab(LiveRightTab::Stack);
         }
@@ -1507,6 +1675,11 @@ fn execute_console_command(
             if let Some(status) = app.search_status.clone() {
                 app.push_console_output(status);
             }
+        }
+        ConsoleCommand::InspectMemory(request) => {
+            app.memory_view_format = request.format;
+            app.latest_memory_request = Some(request.clone());
+            send_console_live_command(app, control_sender, LiveCommand::InspectMemory(request));
         }
         ConsoleCommand::BreakAddress(addr) => {
             send_console_live_command(
@@ -1520,6 +1693,13 @@ fn execute_console_command(
                 app,
                 control_sender,
                 LiveCommand::AddUserBreakpointSymbol(symbol),
+            );
+        }
+        ConsoleCommand::BreakSourceLine { path, line } => {
+            send_console_live_command(
+                app,
+                control_sender,
+                LiveCommand::AddUserBreakpointSourceLine { path, line },
             );
         }
         ConsoleCommand::InfoBreakpoints => {
@@ -1675,12 +1855,26 @@ fn apply_sent_live_command(app: &mut LiveTuiApp, command: LiveCommand) {
             app.status_line = "waiting for next stop...".to_string();
             app.last_command_message = Some("waiting for next stop...".to_string());
         }
+        LiveCommand::SourceStep => {
+            app.target_status = LiveTargetStatus::SourceStepping;
+            app.follow_tail = false;
+            app.status_line = "waiting for next source location...".to_string();
+            app.last_command_message = Some("waiting for next source location...".to_string());
+        }
+        LiveCommand::SourceStepOver => {
+            app.target_status = LiveTargetStatus::SourceSteppingOver;
+            app.follow_tail = false;
+            app.status_line = "waiting for next source location...".to_string();
+            app.last_command_message = Some("waiting for next source location...".to_string());
+        }
         LiveCommand::AddUserBreakpointAddress(_)
         | LiveCommand::AddUserBreakpointSymbol(_)
+        | LiveCommand::AddUserBreakpointSourceLine { .. }
         | LiveCommand::DeleteUserBreakpoint(_)
         | LiveCommand::EnableUserBreakpoint(_)
         | LiveCommand::DisableUserBreakpoint(_)
-        | LiveCommand::InspectCodeAt { .. } => {
+        | LiveCommand::InspectCodeAt { .. }
+        | LiveCommand::InspectMemory(_) => {
             app.status_line = format!("{} requested...", command.as_str());
             app.last_command_message = Some(app.status_line.clone());
         }
@@ -1715,12 +1909,13 @@ fn next_live_debugger_pane(current: LiveDebuggerPane, direction: isize) -> LiveD
 }
 
 fn next_live_right_tab(current: LiveRightTab, direction: isize) -> LiveRightTab {
-    const TABS: [LiveRightTab; 5] = [
+    const TABS: [LiveRightTab; 6] = [
         LiveRightTab::Heap,
         LiveRightTab::Stack,
         LiveRightTab::Logs,
         LiveRightTab::Maps,
         LiveRightTab::Breakpoints,
+        LiveRightTab::Memory,
     ];
     let current_index = TABS.iter().position(|tab| *tab == current).unwrap_or(0) as isize;
     let len = TABS.len() as isize;
@@ -2054,6 +2249,137 @@ fn annotation_from_classification(classification: AddressClassification) -> Opti
     }
 }
 
+const MAX_MEMORY_INSPECTION_BYTES: usize = 4096;
+const DEFAULT_MEMORY_WORDS: usize = 16;
+const DEFAULT_MEMORY_BYTES: usize = 64;
+
+fn inspect_memory(
+    pid: Pid,
+    request: &MemoryInspectionRequest,
+    maps: &ProcessMapsSnapshot,
+    latest_heap_layout: Option<&json::JsonTraceRecord>,
+) -> MemoryInspectionSnapshot {
+    let classification = classify_address(request.address, Some(maps), latest_heap_layout);
+    let mut snapshot = MemoryInspectionSnapshot {
+        requested_address: request.address,
+        region_start: None,
+        region_end: None,
+        permissions: None,
+        region_label: None,
+        classification,
+        rows: Vec::new(),
+        truncated: false,
+        read_error: None,
+    };
+
+    let Some(entry) = maps
+        .entries
+        .iter()
+        .find(|entry| entry.start <= request.address && request.address < entry.end)
+    else {
+        snapshot.read_error = Some("address is not mapped".to_string());
+        return snapshot;
+    };
+    snapshot.region_start = Some(entry.start);
+    snapshot.region_end = Some(entry.end);
+    snapshot.permissions = Some(entry.permissions.clone());
+    snapshot.region_label = entry.pathname.clone();
+
+    if !entry.permissions.contains('r') {
+        snapshot.read_error = Some("memory region is not readable".to_string());
+        return snapshot;
+    }
+
+    let requested_bytes = match request.format {
+        MemoryViewFormat::HexWords => request.count.saturating_mul(8),
+        MemoryViewFormat::HexBytes => request.count,
+    }
+    .min(MAX_MEMORY_INSPECTION_BYTES);
+    let max_region_bytes = entry.end.saturating_sub(request.address) as usize;
+    let total_bytes = requested_bytes.min(max_region_bytes);
+    snapshot.truncated = total_bytes < requested_bytes;
+
+    match request.format {
+        MemoryViewFormat::HexWords => {
+            let row_count = total_bytes.saturating_add(7) / 8;
+            for index in 0..row_count {
+                let address = request.address.saturating_add((index * 8) as u64);
+                let len = 8.min(total_bytes.saturating_sub(index * 8));
+                match read_target_memory(pid, address, len) {
+                    Ok(bytes) => {
+                        let word_value = (bytes.len() == 8).then(|| {
+                            let mut array = [0u8; 8];
+                            array.copy_from_slice(&bytes);
+                            u64::from_le_bytes(array)
+                        });
+                        let annotation = word_value.and_then(|value| {
+                            maps.entries
+                                .iter()
+                                .any(|entry| value >= entry.start && value < entry.end)
+                                .then(|| classify_address(value, Some(maps), latest_heap_layout))
+                                .and_then(annotation_from_classification)
+                        });
+                        snapshot.rows.push(MemoryInspectionRow {
+                            address,
+                            bytes,
+                            word_value,
+                            ascii: None,
+                            annotation,
+                        });
+                    }
+                    Err(err) => {
+                        snapshot.truncated = true;
+                        snapshot.read_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        MemoryViewFormat::HexBytes => {
+            let row_count = total_bytes.saturating_add(15) / 16;
+            for index in 0..row_count {
+                let address = request.address.saturating_add((index * 16) as u64);
+                let len = 16.min(total_bytes.saturating_sub(index * 16));
+                match read_target_memory(pid, address, len) {
+                    Ok(bytes) => {
+                        let ascii = bytes
+                            .iter()
+                            .map(|byte| {
+                                if byte.is_ascii_graphic() || *byte == b' ' {
+                                    *byte as char
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect::<String>();
+                        snapshot.rows.push(MemoryInspectionRow {
+                            address,
+                            bytes,
+                            word_value: None,
+                            ascii: Some(ascii),
+                            annotation: None,
+                        });
+                    }
+                    Err(err) => {
+                        snapshot.truncated = true;
+                        snapshot.read_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    snapshot
+}
+
+fn memory_count_or_default(format: MemoryViewFormat, count: Option<usize>) -> usize {
+    count.unwrap_or(match format {
+        MemoryViewFormat::HexWords => DEFAULT_MEMORY_WORDS,
+        MemoryViewFormat::HexBytes => DEFAULT_MEMORY_BYTES,
+    })
+}
+
 fn annotate_register_value(
     value: u64,
     maps: Option<&ProcessMapsSnapshot>,
@@ -2182,6 +2508,84 @@ fn format_live_maps_tab(app: &LiveTuiApp) -> String {
         .unwrap_or_else(|| "process maps unavailable".to_string())
 }
 
+fn format_live_memory_tab(app: &LiveTuiApp) -> String {
+    let Some(snapshot) = app.latest_memory_inspection.as_ref() else {
+        return "no memory selected; use :mem ADDRESS or press g".to_string();
+    };
+    let mut lines = Vec::new();
+    lines.push(format!("Address: 0x{:016x}", snapshot.requested_address));
+    let region = match (snapshot.region_start, snapshot.region_end) {
+        (Some(start), Some(end)) => format!(
+            "{} 0x{start:x}-0x{end:x}",
+            snapshot.region_label.as_deref().unwrap_or("<anonymous>")
+        ),
+        _ => "unmapped".to_string(),
+    };
+    lines.push(format!("Region:  {region}"));
+    lines.push(format!(
+        "Perms:   {}",
+        snapshot.permissions.as_deref().unwrap_or("unknown")
+    ));
+    lines.push(format!(
+        "Meaning: {}",
+        snapshot.classification.short_label()
+    ));
+    lines.push(format!(
+        "Format:  {}",
+        match app.memory_view_format {
+            MemoryViewFormat::HexWords => "words",
+            MemoryViewFormat::HexBytes => "bytes",
+        }
+    ));
+    if let Some(error) = snapshot.read_error.as_ref() {
+        lines.push(format!("Error:   {error}"));
+    }
+    if snapshot.truncated {
+        lines.push("Note:    truncated".to_string());
+    }
+    lines.push(String::new());
+
+    if snapshot.rows.is_empty() {
+        lines.push("no readable memory rows".to_string());
+        return lines.join("\n");
+    }
+
+    for (index, row) in snapshot.rows.iter().enumerate() {
+        let marker = if app.memory_selected_row == Some(index) {
+            ">"
+        } else {
+            " "
+        };
+        match app.memory_view_format {
+            MemoryViewFormat::HexWords => {
+                let value = row
+                    .word_value
+                    .map(|value| format!("0x{value:016x}"))
+                    .unwrap_or_else(|| "<partial>".to_string());
+                let annotation = row.annotation.as_deref().unwrap_or("");
+                lines.push(format!(
+                    "{marker} 0x{:016x}  {value} {annotation}",
+                    row.address
+                ));
+            }
+            MemoryViewFormat::HexBytes => {
+                let hex = row
+                    .bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ascii = row.ascii.as_deref().unwrap_or("");
+                lines.push(format!(
+                    "{marker} 0x{:016x}  {:<47}  |{}|",
+                    row.address, hex, ascii
+                ));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
 fn format_live_registers_pane(app: &LiveTuiApp) -> String {
     let Some(snapshot) = app.latest_register_snapshot.as_ref() else {
         return "registers unavailable".to_string();
@@ -2218,6 +2622,7 @@ pub fn build_minimal_code_context(rip: u64) -> CodeContext {
         symbol_offset: None,
         object: None,
         source: None,
+        source_context: None,
         disassembly: None,
     }
 }
@@ -2241,6 +2646,10 @@ fn build_code_context(
     if context.source.is_none() {
         context.source = source_mapper.and_then(|source_mapper| source_mapper.lookup(rip));
     }
+    context.source_context = context
+        .source
+        .as_ref()
+        .map(|source| read_source_context(source, 4, 6));
 
     let mut disassembly = read_disassembly_snapshot(
         pid,
@@ -2251,6 +2660,82 @@ fn build_code_context(
     annotate_disassembly_targets(&mut disassembly, symbolizer);
     context.disassembly = Some(disassembly);
 
+    context
+}
+
+const MAX_SOURCE_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SOURCE_LINE_CHARS: usize = 160;
+
+pub fn read_source_context(
+    source_location: &SourceLocation,
+    context_before: usize,
+    context_after: usize,
+) -> SourceContext {
+    let path = source_location
+        .file
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
+    let line = source_location.line.map(u64::from).unwrap_or(0);
+    let column = source_location.column.map(u64::from);
+    let mut context = SourceContext {
+        path: path.clone(),
+        line,
+        column,
+        lines: Vec::new(),
+        truncated: false,
+        read_error: None,
+    };
+    if path == "?" || line == 0 {
+        context.read_error = Some("source location incomplete".to_string());
+        return context;
+    }
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            context.read_error = Some(err.to_string());
+            return context;
+        }
+    };
+    if metadata.len() > MAX_SOURCE_FILE_BYTES {
+        context.read_error = Some(format!("source file too large ({} bytes)", metadata.len()));
+        context.truncated = true;
+        return context;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            context.read_error = Some(err.to_string());
+            return context;
+        }
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            context.read_error = Some("source file is not UTF-8".to_string());
+            return context;
+        }
+    };
+    let start = line.saturating_sub(context_before as u64).max(1);
+    let end = line.saturating_add(context_after as u64);
+    for (index, text_line) in text.lines().enumerate() {
+        let number = index as u64 + 1;
+        if number < start {
+            continue;
+        }
+        if number > end {
+            break;
+        }
+        let truncated_text = truncate_text(text_line, MAX_SOURCE_LINE_CHARS);
+        context.truncated |= truncated_text != text_line;
+        context.lines.push(SourceLine {
+            number,
+            text: truncated_text,
+            is_current: number == line,
+        });
+    }
+    if context.lines.is_empty() {
+        context.read_error = Some("source line is outside local file".to_string());
+    }
     context
 }
 
@@ -2450,6 +2935,13 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 }
 
 fn format_live_code_context(app: &LiveTuiApp) -> String {
+    match app.code_pane_mode {
+        CodePaneMode::Disassembly => format_live_code_context_disassembly(app),
+        CodePaneMode::Source => format_live_code_context_source(app),
+    }
+}
+
+fn format_live_code_context_disassembly(app: &LiveTuiApp) -> String {
     app.latest_code_context
         .as_ref()
         .map(|context| {
@@ -2467,6 +2959,54 @@ fn format_live_code_context(app: &LiveTuiApp) -> String {
         })
         .map(|lines| lines.join("\n"))
         .unwrap_or_else(|| "code context unavailable".to_string())
+}
+
+fn format_live_code_context_source(app: &LiveTuiApp) -> String {
+    app.latest_code_context
+        .as_ref()
+        .map(format_source_context_lines)
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_else(|| "source context unavailable".to_string())
+}
+
+pub fn format_source_context_lines(context: &CodeContext) -> Vec<String> {
+    let Some(source_context) = context.source_context.as_ref() else {
+        return vec![
+            "source context unavailable".to_string(),
+            format!(
+                "Source: {}",
+                format_source_location(context.source.as_ref())
+            ),
+        ];
+    };
+    let mut location = format!("{}:{}", source_context.path, source_context.line);
+    if let Some(column) = source_context.column {
+        location.push_str(&format!(":{column}"));
+    }
+    let mut lines = vec![format!("Source: {location}"), String::new()];
+    if let Some(error) = source_context.read_error.as_deref() {
+        lines.push(format!("source unavailable: {error}"));
+    }
+    if source_context.truncated {
+        lines.push("source preview truncated".to_string());
+    }
+    if source_context.lines.is_empty() {
+        if source_context.read_error.is_none() {
+            lines.push("source context unavailable".to_string());
+        }
+        return lines;
+    }
+    lines.extend(source_context.lines.iter().map(format_source_line));
+    lines
+}
+
+fn format_source_line(line: &SourceLine) -> String {
+    let marker = if line.is_current { ">" } else { " " };
+    format!(
+        " {marker} {:>4}  {}",
+        line.number,
+        truncate_text(&line.text, 120)
+    )
 }
 
 fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String {
@@ -2505,7 +3045,7 @@ fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String 
     {
         lines.push(message.to_string());
     }
-    lines.push("keys: Tab focus | 1 heap 2 stack 3 logs 4 maps | Space pause/resume | . stepi | , nexti | n next alloc | c continue".to_string());
+    lines.push("keys: Tab focus | 1 heap 2 stack 3 logs 4 maps | Space pause/resume | S source-step | N source-next | . stepi | , nexti | n next alloc | c continue".to_string());
     if app.search_prompt_active {
         lines.push(format!("jump> {}", app.search_prompt_input));
     } else if app.console_input_active {
@@ -2518,7 +3058,8 @@ fn format_live_console_pane(app: &LiveTuiApp, viewport_height: usize) -> String 
 
 pub fn format_live_breakpoints_tab(app: &LiveTuiApp) -> String {
     if app.user_breakpoints.is_empty() {
-        return "no user breakpoints; use :break *ADDR or :break SYMBOL".to_string();
+        return "no user breakpoints; use :break *ADDR, :break SYMBOL, or :break FILE:LINE"
+            .to_string();
     }
 
     let mut lines =
@@ -2539,21 +3080,26 @@ pub fn format_live_breakpoints_tab(app: &LiveTuiApp) -> String {
             breakpoint.id.as_u64(),
             state,
             format_register_value_fixed_hex(breakpoint.resolved_address),
-            breakpoint_label_for_display(breakpoint),
+            breakpoint_location_for_display(breakpoint),
             breakpoint.hit_count
         ));
-        if let Some(source) = breakpoint.source.as_ref() {
+        if breakpoint.resolved_symbol.is_some() {
+            if let Some(source) = breakpoint.source_summary() {
+                lines.push(format!("     {source}"));
+            }
+        } else if let Some(source) = breakpoint.source.as_ref() {
             lines.push(format!("     {}", format_source_location(Some(source))));
         }
     }
     lines.join("\n")
 }
 
-fn breakpoint_label_for_display(breakpoint: &UserBreakpoint) -> &str {
+fn breakpoint_location_for_display(breakpoint: &UserBreakpoint) -> String {
     breakpoint
         .resolved_symbol
-        .as_deref()
-        .unwrap_or(breakpoint.label.as_str())
+        .clone()
+        .or_else(|| breakpoint.source_summary())
+        .unwrap_or_else(|| breakpoint.label.clone())
 }
 
 fn format_live_logs_pane(app: &LiveTuiApp) -> String {
@@ -2697,18 +3243,34 @@ pub fn parse_heap_search_query(input: &str) -> Result<HeapSearchQuery> {
 }
 
 pub fn parse_console_command(input: &str) -> ConsoleCommand {
+    parse_console_command_with_registers(input, None)
+}
+
+fn parse_console_command_for_app(input: &str, app: &LiveTuiApp) -> ConsoleCommand {
+    parse_console_command_with_registers(input, app.latest_register_snapshot.as_ref())
+}
+
+fn parse_console_command_with_registers(
+    input: &str,
+    registers: Option<&RegisterSnapshot>,
+) -> ConsoleCommand {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return ConsoleCommand::Unknown(String::new());
     }
 
     let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    if let Some(command) = parse_memory_console_command(&tokens, registers) {
+        return command;
+    }
     match tokens.as_slice() {
         ["help" | "h" | "?"] => ConsoleCommand::Help,
         ["continue" | "c" | "run"] => ConsoleCommand::Continue,
         ["pause" | "p"] => ConsoleCommand::Pause,
         ["resume" | "r"] => ConsoleCommand::Resume,
-        ["stepi" | "si" | "step"] => ConsoleCommand::StepInstruction,
+        ["source-step" | "ss"] => ConsoleCommand::SourceStep,
+        ["source-next" | "sn"] => ConsoleCommand::SourceStepOver,
+        ["stepi" | "si"] => ConsoleCommand::StepInstruction,
         ["nexti" | "ni"] => ConsoleCommand::StepInstructionOver,
         ["next" | "n" | "next-alloc" | "next_allocator_event"] => {
             ConsoleCommand::NextAllocatorEvent
@@ -2716,12 +3278,13 @@ pub fn parse_console_command(input: &str) -> ConsoleCommand {
         ["stop" | "quit" | "q"] => ConsoleCommand::Stop,
         ["regs" | "registers"] => ConsoleCommand::Registers,
         ["disas" | "disassemble"] => ConsoleCommand::Disassemble,
+        ["source" | "list"] => ConsoleCommand::Source,
         ["stack"] => ConsoleCommand::Stack,
         ["maps"] => ConsoleCommand::Maps,
         ["breaks"] => ConsoleCommand::SelectRightTab(LiveRightTab::Breakpoints),
-        ["break" | "b"] => {
-            ConsoleCommand::Unknown("usage: break *ADDR or break SYMBOL".to_string())
-        }
+        ["break" | "b"] => ConsoleCommand::Unknown(
+            "usage: break *ADDR, break SYMBOL, or break FILE:LINE".to_string(),
+        ),
         ["break" | "b", location] => parse_breakpoint_location(location)
             .unwrap_or_else(|| ConsoleCommand::Unknown(trimmed.to_string())),
         ["info", "break" | "breaks"] => ConsoleCommand::InfoBreakpoints,
@@ -2749,9 +3312,107 @@ pub fn parse_console_command(input: &str) -> ConsoleCommand {
     }
 }
 
+fn parse_memory_console_command(
+    tokens: &[&str],
+    registers: Option<&RegisterSnapshot>,
+) -> Option<ConsoleCommand> {
+    match tokens {
+        ["mem" | "inspect", addr] => Some(memory_request_command(
+            addr,
+            MemoryViewFormat::HexWords,
+            DEFAULT_MEMORY_WORDS,
+            registers,
+        )),
+        ["x", addr] => Some(memory_request_command(
+            addr,
+            MemoryViewFormat::HexWords,
+            DEFAULT_MEMORY_WORDS,
+            registers,
+        )),
+        [spec, addr] if spec.starts_with("x/") => {
+            let spec = spec.strip_prefix("x/")?;
+            let (count_text, format) = if let Some(count) = spec.strip_suffix("gx") {
+                (count, MemoryViewFormat::HexWords)
+            } else if let Some(count) = spec.strip_suffix("xb") {
+                (count, MemoryViewFormat::HexBytes)
+            } else {
+                return Some(ConsoleCommand::Unknown(format!(
+                    "unsupported memory format: {spec}"
+                )));
+            };
+            let Ok(count) = count_text.parse::<usize>() else {
+                return Some(ConsoleCommand::Unknown(format!(
+                    "invalid memory count: {count_text}"
+                )));
+            };
+            if count == 0 {
+                return Some(ConsoleCommand::Unknown(
+                    "memory count must be positive".to_string(),
+                ));
+            }
+            let max_count = match format {
+                MemoryViewFormat::HexWords => MAX_MEMORY_INSPECTION_BYTES / 8,
+                MemoryViewFormat::HexBytes => MAX_MEMORY_INSPECTION_BYTES,
+            };
+            if count > max_count {
+                return Some(ConsoleCommand::Unknown(format!(
+                    "memory count exceeds maximum {max_count}"
+                )));
+            }
+            Some(memory_request_command(addr, format, count, registers))
+        }
+        _ => None,
+    }
+}
+
+fn memory_request_command(
+    address: &str,
+    format: MemoryViewFormat,
+    count: usize,
+    registers: Option<&RegisterSnapshot>,
+) -> ConsoleCommand {
+    match parse_memory_address(address, registers) {
+        Ok(address) => ConsoleCommand::InspectMemory(MemoryInspectionRequest {
+            address,
+            count,
+            format,
+        }),
+        Err(err) => ConsoleCommand::Unknown(err.to_string()),
+    }
+}
+
+fn parse_memory_address(input: &str, registers: Option<&RegisterSnapshot>) -> Result<u64> {
+    if let Some(name) = input.strip_prefix('$') {
+        let normalized = normalize_register_name(name);
+        let snapshot = registers.context("register snapshot unavailable")?;
+        return match normalized.as_str() {
+            "rip" => Ok(snapshot.instruction_pointer),
+            "rsp" => Ok(snapshot.stack_pointer),
+            "rbp" => Ok(snapshot.frame_pointer),
+            _ => snapshot
+                .get(&normalized)
+                .with_context(|| format!("unknown register: ${name}")),
+        };
+    }
+    parse_u64_auto_radix(input)
+}
+
 fn parse_breakpoint_location(location: &str) -> Option<ConsoleCommand> {
     if let Some(addr) = location.strip_prefix('*') {
         return parse_addr(addr).ok().map(ConsoleCommand::BreakAddress);
+    }
+    if let Some((path, line)) = location.rsplit_once(':') {
+        if !path.is_empty() {
+            if let Ok(line) = line.parse::<u64>() {
+                if line == 0 {
+                    return None;
+                }
+                return Some(ConsoleCommand::BreakSourceLine {
+                    path: path.to_string(),
+                    line,
+                });
+            }
+        }
     }
     (!location.is_empty()).then(|| ConsoleCommand::BreakSymbol(location.to_string()))
 }
@@ -2767,6 +3428,7 @@ fn parse_console_tab(tab: &str) -> Option<LiveRightTab> {
         "logs" => Some(LiveRightTab::Logs),
         "maps" => Some(LiveRightTab::Maps),
         "breaks" | "breakpoints" => Some(LiveRightTab::Breakpoints),
+        "memory" | "mem" => Some(LiveRightTab::Memory),
         _ => None,
     }
 }
@@ -12344,6 +13006,25 @@ mod tests {
                 line: Some(42),
                 column: Some(7),
             }),
+            source_context: Some(super::SourceContext {
+                path: "src/main.c".to_string(),
+                line: 42,
+                column: Some(7),
+                lines: vec![
+                    super::SourceLine {
+                        number: 41,
+                        text: "int argc = 1;".to_string(),
+                        is_current: false,
+                    },
+                    super::SourceLine {
+                        number: 42,
+                        text: "void *p = malloc(0x30);".to_string(),
+                        is_current: true,
+                    },
+                ],
+                truncated: false,
+                read_error: None,
+            }),
             disassembly: Some(super::DisassemblySnapshot {
                 instruction_pointer: rip,
                 start_address: rip,
@@ -12376,6 +13057,35 @@ mod tests {
             label: format!("main+0x{id:x}"),
             resolved_symbol: Some(format!("main+0x{id:x}")),
             source: None,
+            source_resolution: None,
+        }
+    }
+
+    fn test_source_user_breakpoint(id: u64, address: u64) -> super::UserBreakpoint {
+        super::UserBreakpoint {
+            id: super::UserBreakpointId(id),
+            spec: super::UserBreakpointSpec::SourceLine {
+                path: "src/main.c".to_string(),
+                line: 42,
+            },
+            resolved_address: address,
+            enabled: true,
+            hit_count: 0,
+            label: "src/main.c:42".to_string(),
+            resolved_symbol: None,
+            source: Some(SourceLocation {
+                file: Some("src/main.c".to_string()),
+                line: Some(42),
+                column: None,
+            }),
+            source_resolution: Some(super::SourceBreakpointResolution {
+                requested_path: "main.c".to_string(),
+                requested_line: 42,
+                resolved_path: "src/main.c".to_string(),
+                resolved_line: 42,
+                resolved_address: address,
+                symbol: None,
+            }),
         }
     }
 
@@ -12931,7 +13641,7 @@ mod tests {
 
         assert_eq!(
             super::format_live_breakpoints_tab(&app),
-            "no user breakpoints; use :break *ADDR or :break SYMBOL"
+            "no user breakpoints; use :break *ADDR, :break SYMBOL, or :break FILE:LINE"
         );
     }
 
@@ -12952,6 +13662,18 @@ mod tests {
         assert!(rendered.contains("main+0x1"));
         assert!(rendered.contains("  2  disabled"));
         assert!(rendered.contains("0x00007ffff7df1234"));
+    }
+
+    #[test]
+    fn breakpoints_tab_renders_source_breakpoint_location() {
+        let mut app = super::LiveTuiApp::default();
+        app.user_breakpoints = vec![test_source_user_breakpoint(3, 0x4011a1)];
+
+        let rendered = super::format_live_breakpoints_tab(&app);
+
+        assert!(rendered.contains("3  enabled"));
+        assert!(rendered.contains("0x00000000004011a1"));
+        assert!(rendered.contains("src/main.c:42"));
     }
 
     #[test]
@@ -13046,6 +13768,34 @@ mod tests {
     }
 
     #[test]
+    fn source_context_rendering_highlights_current_line() {
+        let context = test_code_context(0x4011a5);
+
+        let rendered = super::format_source_context_lines(&context).join("\n");
+
+        assert!(rendered.contains("Source: src/main.c:42:7"));
+        assert!(rendered.contains(" >   42  void *p = malloc(0x30);"));
+    }
+
+    #[test]
+    fn source_context_unavailable_rendering_is_compact() {
+        let mut context = test_code_context(0x4011a5);
+        context.source_context = Some(super::SourceContext {
+            path: "src/missing.c".to_string(),
+            line: 7,
+            column: None,
+            lines: vec![],
+            truncated: false,
+            read_error: Some("not found".to_string()),
+        });
+
+        let rendered = super::format_source_context_lines(&context).join("\n");
+
+        assert!(rendered.contains("Source: src/missing.c:7"));
+        assert!(rendered.contains("source unavailable: not found"));
+    }
+
+    #[test]
     fn live_tui_scrolls_code_pane() {
         let mut app = super::LiveTuiApp::default();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -13101,6 +13851,7 @@ mod tests {
         app.code_view_address = Some(0x4011a5);
         app.code_view_breakpoint_id = Some(super::UserBreakpointId(1));
         app.code_pane_scroll = 99;
+        app.code_pane_mode = super::CodePaneMode::Source;
         app.latest_code_context = Some(test_code_context(0x4011a5));
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('d'),
@@ -13110,9 +13861,27 @@ mod tests {
         super::handle_live_tui_key(key, &mut app, false, &sender);
 
         assert!(app.code_follow_rip);
+        assert_eq!(app.code_pane_mode, super::CodePaneMode::Source);
         assert_eq!(app.code_view_address, None);
         assert_eq!(app.code_view_breakpoint_id, None);
         assert!(app.code_pane_scroll < 99);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_tui_v_toggles_code_pane_mode_when_code_focused() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.focused_debugger_pane = super::LiveDebuggerPane::Code;
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('v'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+        assert_eq!(app.code_pane_mode, super::CodePaneMode::Source);
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+        assert_eq!(app.code_pane_mode, super::CodePaneMode::Disassembly);
         assert!(receiver.try_recv().is_err());
     }
 
@@ -13147,6 +13916,25 @@ mod tests {
         assert!(app.code_follow_rip);
         assert!(app.code_pane_scroll < 42);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn console_source_and_list_focus_code_source_mode() {
+        for command in [
+            super::ConsoleCommand::Source,
+            super::parse_console_command("list"),
+        ] {
+            let mut app = super::LiveTuiApp::default();
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            let should_exit =
+                super::execute_console_command(&mut app, command, "source", false, &sender);
+
+            assert!(!should_exit);
+            assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Code);
+            assert_eq!(app.code_pane_mode, super::CodePaneMode::Source);
+            assert!(receiver.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -13492,6 +14280,33 @@ mod tests {
             Some(super::UserBreakpointId(1))
         );
         assert!(!app.code_follow_rip);
+        assert!(matches!(
+            receiver.try_recv().unwrap().command,
+            super::LiveCommand::InspectCodeAt {
+                address: 0x4011a5,
+                breakpoint_id: Some(super::UserBreakpointId(1))
+            }
+        ));
+    }
+
+    #[test]
+    fn enter_on_source_breakpoint_selects_source_mode() {
+        let mut app = super::LiveTuiApp::default();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.target_status = super::LiveTargetStatus::Paused;
+        app.focused_debugger_pane = super::LiveDebuggerPane::RightTab;
+        app.active_right_tab = super::LiveRightTab::Breakpoints;
+        app.user_breakpoints = vec![test_source_user_breakpoint(1, 0x4011a5)];
+        app.selected_user_breakpoint_index = Some(0);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        super::handle_live_tui_key(key, &mut app, false, &sender);
+
+        assert_eq!(app.focused_debugger_pane, super::LiveDebuggerPane::Code);
+        assert_eq!(app.code_pane_mode, super::CodePaneMode::Source);
         assert!(matches!(
             receiver.try_recv().unwrap().command,
             super::LiveCommand::InspectCodeAt {
@@ -13892,10 +14707,26 @@ mod tests {
 
     #[test]
     fn parse_console_command_step_instruction_aliases() {
-        for input in ["stepi", "si", "step"] {
+        for input in ["stepi", "si"] {
             assert_eq!(
                 super::parse_console_command(input),
                 super::ConsoleCommand::StepInstruction
+            );
+        }
+    }
+
+    #[test]
+    fn parse_console_command_source_step_aliases() {
+        for input in ["source-step", "ss"] {
+            assert_eq!(
+                super::parse_console_command(input),
+                super::ConsoleCommand::SourceStep
+            );
+        }
+        for input in ["source-next", "sn"] {
+            assert_eq!(
+                super::parse_console_command(input),
+                super::ConsoleCommand::SourceStepOver
             );
         }
     }
@@ -13927,6 +14758,31 @@ mod tests {
         assert_eq!(
             super::parse_console_command("b malloc"),
             super::ConsoleCommand::BreakSymbol("malloc".to_string())
+        );
+        assert_eq!(
+            super::parse_console_command("break src/main.c:42"),
+            super::ConsoleCommand::BreakSourceLine {
+                path: "src/main.c".to_string(),
+                line: 42
+            }
+        );
+        assert_eq!(
+            super::parse_console_command("b examples/foo.c:7"),
+            super::ConsoleCommand::BreakSourceLine {
+                path: "examples/foo.c".to_string(),
+                line: 7
+            }
+        );
+        assert_eq!(
+            super::parse_console_command("break c:src/main.c:42"),
+            super::ConsoleCommand::BreakSourceLine {
+                path: "c:src/main.c".to_string(),
+                line: 42
+            }
+        );
+        assert_eq!(
+            super::parse_console_command("break src/main.c:0"),
+            super::ConsoleCommand::Unknown("break src/main.c:0".to_string())
         );
         assert_eq!(
             super::parse_console_command("info break"),
@@ -13972,6 +14828,80 @@ mod tests {
             super::parse_console_command("jump s 0x30"),
             super::ConsoleCommand::HeapJump(super::HeapSearchQuery::Size(0x30))
         );
+    }
+
+    #[test]
+    fn parse_console_command_memory_queries() {
+        assert_eq!(
+            super::parse_console_command("mem 0x1000"),
+            super::ConsoleCommand::InspectMemory(super::MemoryInspectionRequest {
+                address: 0x1000,
+                count: 16,
+                format: super::MemoryViewFormat::HexWords,
+            })
+        );
+        assert_eq!(
+            super::parse_console_command("inspect 0x1000"),
+            super::ConsoleCommand::InspectMemory(super::MemoryInspectionRequest {
+                address: 0x1000,
+                count: 16,
+                format: super::MemoryViewFormat::HexWords,
+            })
+        );
+        assert_eq!(
+            super::parse_console_command("x/16gx 0x1000"),
+            super::ConsoleCommand::InspectMemory(super::MemoryInspectionRequest {
+                address: 0x1000,
+                count: 16,
+                format: super::MemoryViewFormat::HexWords,
+            })
+        );
+        assert_eq!(
+            super::parse_console_command("x/64xb 0x1000"),
+            super::ConsoleCommand::InspectMemory(super::MemoryInspectionRequest {
+                address: 0x1000,
+                count: 64,
+                format: super::MemoryViewFormat::HexBytes,
+            })
+        );
+        assert!(matches!(
+            super::parse_console_command("x/0gx 0x1000"),
+            super::ConsoleCommand::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn memory_tab_renders_words_and_bytes() {
+        let mut app = super::LiveTuiApp::default();
+        app.memory_view_format = super::MemoryViewFormat::HexWords;
+        app.memory_selected_row = Some(0);
+        app.latest_memory_inspection = Some(super::MemoryInspectionSnapshot {
+            requested_address: 0x1000,
+            region_start: Some(0x1000),
+            region_end: Some(0x2000),
+            permissions: Some("rw-p".to_string()),
+            region_label: Some("[heap]".to_string()),
+            classification: super::classify_address(0x1000, Some(&test_process_maps()), None),
+            rows: vec![super::MemoryInspectionRow {
+                address: 0x1000,
+                bytes: 0x31u64.to_le_bytes().to_vec(),
+                word_value: Some(0x31),
+                ascii: None,
+                annotation: None,
+            }],
+            truncated: false,
+            read_error: None,
+        });
+
+        let words = super::format_live_memory_tab(&app);
+        assert!(words.contains("Address: 0x0000000000001000"));
+        assert!(words.contains("> 0x0000000000001000  0x0000000000000031"));
+
+        app.memory_view_format = super::MemoryViewFormat::HexBytes;
+        app.latest_memory_inspection.as_mut().unwrap().rows[0].word_value = None;
+        app.latest_memory_inspection.as_mut().unwrap().rows[0].ascii = Some("1.......".to_string());
+        let bytes = super::format_live_memory_tab(&app);
+        assert!(bytes.contains("|1.......|"));
     }
 
     #[test]
@@ -14408,6 +15338,36 @@ mod tests {
         assert!(!should_exit);
         assert!(receiver.try_recv().is_err());
         assert!(app.status_line.contains("not allowed"));
+    }
+
+    #[test]
+    fn live_tui_source_step_keys_map_to_source_commands() {
+        for (key_char, expected, status) in [
+            (
+                'S',
+                super::LiveCommand::SourceStep,
+                super::LiveTargetStatus::SourceStepping,
+            ),
+            (
+                'N',
+                super::LiveCommand::SourceStepOver,
+                super::LiveTargetStatus::SourceSteppingOver,
+            ),
+        ] {
+            let mut app = super::LiveTuiApp::default();
+            app.target_status = super::LiveTargetStatus::Paused;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let key = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(key_char),
+                crossterm::event::KeyModifiers::NONE,
+            );
+
+            let should_exit = super::handle_live_tui_key(key, &mut app, false, &sender);
+
+            assert!(!should_exit);
+            assert_eq!(receiver.try_recv().unwrap().command, expected);
+            assert_eq!(app.target_status, status);
+        }
     }
 
     #[test]
@@ -15474,6 +16434,7 @@ mod tests {
                 super::LiveTraceUpdate::StackSnapshot { .. } => "stack_snapshot",
                 super::LiveTraceUpdate::CodeContext { .. } => "code_context",
                 super::LiveTraceUpdate::CodeInspection { .. } => "code_inspection",
+                super::LiveTraceUpdate::MemoryInspection { .. } => "memory_inspection",
                 super::LiveTraceUpdate::UserBreakpoints { .. } => "user_breakpoints",
                 super::LiveTraceUpdate::BreakMatched(_) => "break_matched",
                 super::LiveTraceUpdate::SessionEnd(_) => "session_end",
@@ -15743,6 +16704,37 @@ mod tests {
     }
 
     #[test]
+    fn source_step_live_only_updates_are_ignored_by_json_sink() {
+        let path = unique_temp_path("heapify-source-step-live-only-json");
+        let mut writer = super::JsonWriter::file(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        {
+            let mut sink = super::LiveTuiSink {
+                sender,
+                json_writer: Some(&mut writer),
+            };
+            sink.on_update(&super::LiveTraceUpdate::CommandStatus {
+                command_id: Some(super::LiveCommandId(1)),
+                command: Some(super::LiveCommand::SourceStep),
+                status: super::LiveCommandStatus::Completed,
+                target_status: super::LiveTargetStatus::Paused,
+                message: "source-step: src/main.c:12 -> :13 after 8 instructions".to_string(),
+            })
+            .unwrap();
+        }
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::LiveTraceUpdate::CommandStatus { .. }
+        ));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(contents.is_empty());
+    }
+
+    #[test]
     fn live_tui_sink_does_not_write_break_matched_to_json() {
         let path = unique_temp_path("heapify-live-break-matched-json");
         let mut writer = super::JsonWriter::file(&path).unwrap();
@@ -15795,6 +16787,7 @@ mod tests {
                     label: "main".to_string(),
                     resolved_symbol: Some("main".to_string()),
                     source: None,
+                    source_resolution: None,
                 }],
             })
             .unwrap();

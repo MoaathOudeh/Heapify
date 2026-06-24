@@ -9,8 +9,15 @@ pub enum LiveCommand {
     StepAllocatorEvent,
     StepInstruction,
     StepInstructionOver,
+    SourceStep,
+    SourceStepOver,
+    InspectMemory(MemoryInspectionRequest),
     AddUserBreakpointAddress(u64),
     AddUserBreakpointSymbol(String),
+    AddUserBreakpointSourceLine {
+        path: String,
+        line: u64,
+    },
     DeleteUserBreakpoint(UserBreakpointId),
     EnableUserBreakpoint(UserBreakpointId),
     DisableUserBreakpoint(UserBreakpointId),
@@ -30,8 +37,12 @@ impl LiveCommand {
             LiveCommand::StepAllocatorEvent => "step_allocator_event",
             LiveCommand::StepInstruction => "step_instruction",
             LiveCommand::StepInstructionOver => "step_instruction_over",
+            LiveCommand::SourceStep => "source_step",
+            LiveCommand::SourceStepOver => "source_step_over",
+            LiveCommand::InspectMemory(_) => "inspect_memory",
             LiveCommand::AddUserBreakpointAddress(_) => "break_address",
             LiveCommand::AddUserBreakpointSymbol(_) => "break_symbol",
+            LiveCommand::AddUserBreakpointSourceLine { .. } => "break_source",
             LiveCommand::DeleteUserBreakpoint(_) => "delete_breakpoint",
             LiveCommand::EnableUserBreakpoint(_) => "enable_breakpoint",
             LiveCommand::DisableUserBreakpoint(_) => "disable_breakpoint",
@@ -57,6 +68,8 @@ pub enum LiveTargetStatus {
     SteppingToNextAllocatorEvent,
     SteppingInstruction,
     SteppingInstructionOver,
+    SourceStepping,
+    SourceSteppingOver,
     Stopping,
     Exited,
 }
@@ -70,6 +83,8 @@ impl LiveTargetStatus {
             LiveTargetStatus::SteppingToNextAllocatorEvent => "stepping_to_next_allocator_event",
             LiveTargetStatus::SteppingInstruction => "stepping_instruction",
             LiveTargetStatus::SteppingInstructionOver => "stepping_instruction_over",
+            LiveTargetStatus::SourceStepping => "source_stepping",
+            LiveTargetStatus::SourceSteppingOver => "source_stepping_over",
             LiveTargetStatus::Stopping => "stopping",
             LiveTargetStatus::Exited => "exited",
         }
@@ -107,6 +122,8 @@ pub fn validate_live_command(
                 | LiveTargetStatus::SteppingToNextAllocatorEvent
                 | LiveTargetStatus::SteppingInstruction
                 | LiveTargetStatus::SteppingInstructionOver
+                | LiveTargetStatus::SourceStepping
+                | LiveTargetStatus::SourceSteppingOver
         ),
         LiveCommand::Resume => target_status == LiveTargetStatus::Paused,
         LiveCommand::Continue => matches!(
@@ -114,11 +131,14 @@ pub fn validate_live_command(
             LiveTargetStatus::Paused | LiveTargetStatus::SteppingToNextAllocatorEvent
         ),
         LiveCommand::StepAllocatorEvent => target_status == LiveTargetStatus::Paused,
-        LiveCommand::StepInstruction | LiveCommand::StepInstructionOver => {
-            target_status == LiveTargetStatus::Paused
-        }
+        LiveCommand::StepInstruction
+        | LiveCommand::StepInstructionOver
+        | LiveCommand::SourceStep
+        | LiveCommand::SourceStepOver
+        | LiveCommand::InspectMemory(_) => target_status == LiveTargetStatus::Paused,
         LiveCommand::AddUserBreakpointAddress(_)
         | LiveCommand::AddUserBreakpointSymbol(_)
+        | LiveCommand::AddUserBreakpointSourceLine { .. }
         | LiveCommand::DeleteUserBreakpoint(_)
         | LiveCommand::EnableUserBreakpoint(_)
         | LiveCommand::DisableUserBreakpoint(_)
@@ -137,10 +157,25 @@ pub fn validate_live_command(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryViewFormat {
+    HexWords,
+    HexBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInspectionRequest {
+    pub address: u64,
+    pub count: usize,
+    pub format: MemoryViewFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveTraceRunMode {
     Continuous,
     StepAllocatorEvent,
     UserInstructionStepOver,
+    SourceStepInto,
+    SourceStepOver,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +198,20 @@ pub enum DebuggerStopReason {
     InstructionStepOver {
         from_rip: u64,
         to_rip: u64,
+    },
+    SourceStep {
+        from: crate::SourceLocation,
+        to: crate::SourceLocation,
+        instructions_executed: u64,
+    },
+    SourceStepOver {
+        from: crate::SourceLocation,
+        to: crate::SourceLocation,
+        instructions_executed: u64,
+    },
+    SourceStepLimit {
+        from: crate::SourceLocation,
+        instructions_executed: u64,
     },
     AllocatorBreakCondition {
         event_id: usize,
@@ -195,6 +244,30 @@ impl DebuggerStopReason {
             DebuggerStopReason::InstructionStepOver { from_rip, to_rip } => {
                 format!("nexti completed: 0x{from_rip:x} -> 0x{to_rip:x}")
             }
+            DebuggerStopReason::SourceStep {
+                from,
+                to,
+                instructions_executed,
+            } => format!(
+                "source-step: {} -> {} after {} instructions",
+                crate::format_source_location_short(from),
+                crate::format_source_location_delta(from, to),
+                instructions_executed
+            ),
+            DebuggerStopReason::SourceStepOver {
+                from,
+                to,
+                instructions_executed,
+            } => format!(
+                "source-next: {} -> {} after {} instructions",
+                crate::format_source_location_short(from),
+                crate::format_source_location_delta(from, to),
+                instructions_executed
+            ),
+            DebuggerStopReason::SourceStepLimit {
+                instructions_executed,
+                ..
+            } => format!("source-step limit reached after {instructions_executed} instructions"),
             DebuggerStopReason::AllocatorBreakCondition { event_id, message } => {
                 format!("break condition matched after event #{event_id}: {message}")
             }

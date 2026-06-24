@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use gimli::{EndianRcSlice, RunTimeEndian};
+use gimli::{EndianRcSlice, Reader, RunTimeEndian};
 use heapify_core::glibc::{
     decode_safe_linked_ptr, select_glibc_profile, suggest_glibc_profile_for_version, BinExperiment,
     BinExperimentRole, BinPointerCandidate, FastbinChain, FastbinExperiment, FastbinExperimentRole,
@@ -64,17 +64,35 @@ pub use process::{
 };
 pub use run_control::{
     validate_live_command, AllocatorEventControl, DebuggerStopReason, LiveCommand, LiveCommandId,
-    LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, StepKind,
+    LiveCommandMessage, LiveCommandStatus, LiveTargetStatus, MemoryInspectionRequest,
+    MemoryViewFormat, StepKind,
 };
 use run_control::{
     LiveControlOutcome, LiveTraceRunMode, LiveWorkerPauseState, PendingInstructionStepOver,
     TraceWaitMode,
 };
 
+const DEFAULT_SOURCE_STEP_BUDGET: u64 = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocationTraceMode {
     TargetPlt,
     LibcSymbols,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceStepKind {
+    Into,
+    Over,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceStepState {
+    kind: SourceStepKind,
+    origin: SourceLocation,
+    origin_rip: u64,
+    instructions_executed: u64,
+    instruction_budget: u64,
 }
 
 impl AllocationTraceMode {
@@ -89,7 +107,8 @@ impl AllocationTraceMode {
 mod breakpoint;
 pub use breakpoint::{
     Breakpoint, BreakpointKind, BreakpointManager, BreakpointOwner, BreakpointPurpose,
-    ManagedBreakpoint, UserBreakpoint, UserBreakpointId, UserBreakpointSpec,
+    ManagedBreakpoint, SourceBreakpointResolution, UserBreakpoint, UserBreakpointId,
+    UserBreakpointSpec,
 };
 
 struct TraceHeapState<F>
@@ -386,14 +405,7 @@ impl TargetSourceMapper {
         let context =
             addr2line::Context::from_dwarf(dwarf).context("failed to build addr2line context")?;
 
-        let load_base = if heapify_elf::is_pie(program_path)? {
-            let mapping = find_executable_mapping(pid, program_path)?.with_context(|| {
-                format!("failed to find executable mapping for PIE target: {program_path}")
-            })?;
-            mapping_load_base(&mapping)?
-        } else {
-            0
-        };
+        let load_base = target_runtime_load_bias(pid, program_path)?;
 
         Ok(Self { context, load_base })
     }
@@ -410,6 +422,290 @@ impl TargetSourceMapper {
         (source.file.is_some() || source.line.is_some() || source.column.is_some())
             .then_some(source)
     }
+}
+
+fn target_runtime_load_bias(pid: Pid, program_path: &str) -> Result<u64> {
+    if heapify_elf::is_pie(program_path)? {
+        let mapping = find_executable_mapping(pid, program_path)?.with_context(|| {
+            format!("failed to find executable mapping for PIE target: {program_path}")
+        })?;
+        mapping_load_base(&mapping)
+    } else {
+        Ok(0)
+    }
+}
+
+pub fn resolve_source_line_breakpoint(
+    target_elf_path: &Path,
+    target_runtime_load_bias: u64,
+    requested_path: &str,
+    requested_line: u64,
+) -> Result<SourceBreakpointResolution> {
+    if requested_line == 0 {
+        bail!("source breakpoint line must be greater than 0");
+    }
+    let path = target_elf_path
+        .to_str()
+        .context("target executable path is not valid UTF-8")?;
+    if matches!(
+        heapify_elf::elf_file_type(path)?,
+        heapify_elf::ElfFileType::SharedObject
+    ) {
+        bail!("source breakpoints currently support the target executable only");
+    }
+    let bytes = std::fs::read(target_elf_path)
+        .with_context(|| format!("failed to read ELF file: {path}"))?;
+    let object = object::File::parse(bytes.as_slice())
+        .with_context(|| format!("failed to parse ELF file: {path}"))?;
+    let endian = if object.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+    let mut dwarf =
+        gimli::Dwarf::load(|section_id| load_dwarf_section(&object, section_id.name(), endian))
+            .context("failed to load target DWARF sections")?;
+    dwarf.populate_abbreviations_cache(gimli::AbbreviationsCacheStrategy::Duplicates);
+
+    let mut rows = Vec::new();
+    let mut units = dwarf.units();
+    while let Some(header) = units.next().context("failed to read DWARF unit header")? {
+        let unit = dwarf.unit(header).context("failed to read DWARF unit")?;
+        let Some(program) = unit.line_program.clone() else {
+            continue;
+        };
+        let mut line_rows = program.rows();
+        while let Some((header, row)) = line_rows.next_row().context("failed to read line row")? {
+            if row.end_sequence() {
+                continue;
+            }
+            let Some(line) = row.line().map(|line| line.get()) else {
+                continue;
+            };
+            let Some(file) = row.file(header) else {
+                continue;
+            };
+            let Some(path) = line_file_path(&dwarf, &unit, header, file)? else {
+                continue;
+            };
+            rows.push(SourceLineRow {
+                path,
+                line,
+                address: row.address(),
+            });
+        }
+    }
+
+    let candidates = select_source_path_candidates(&rows, requested_path)?;
+    let best = candidates
+        .into_iter()
+        .filter(|row| row.line == requested_line)
+        .min_by_key(|row| row.address)
+        .with_context(|| {
+            format!("no executable statement found for {requested_path}:{requested_line}")
+        })?;
+    let resolved_address = target_runtime_load_bias
+        .checked_add(best.address)
+        .context("runtime source breakpoint address overflow")?;
+    let symbol = heapify_elf::list_symbols(path).ok().and_then(|symbols| {
+        symbols
+            .into_iter()
+            .filter(|symbol| symbol.addr <= best.address)
+            .max_by_key(|symbol| symbol.addr)
+            .map(|symbol| {
+                if best.address > symbol.addr {
+                    format!("{}+0x{:x}", symbol.name, best.address - symbol.addr)
+                } else {
+                    symbol.name
+                }
+            })
+    });
+
+    Ok(SourceBreakpointResolution {
+        requested_path: requested_path.to_string(),
+        requested_line,
+        resolved_path: best.path.clone(),
+        resolved_line: best.line,
+        resolved_address,
+        symbol,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLineRow {
+    pub path: String,
+    pub line: u64,
+    pub address: u64,
+}
+
+fn line_file_path(
+    dwarf: &gimli::Dwarf<SourceDwarfReader>,
+    unit: &gimli::Unit<SourceDwarfReader>,
+    header: &gimli::LineProgramHeader<SourceDwarfReader>,
+    file: &gimli::FileEntry<SourceDwarfReader>,
+) -> Result<Option<String>> {
+    let Some(path_name) = dwarf_attr_string(dwarf, unit, file.path_name())? else {
+        return Ok(None);
+    };
+    let path = Path::new(&path_name);
+    if path.is_absolute() {
+        return Ok(Some(normalize_source_path(&path_name)));
+    }
+    let directory = file
+        .directory(header)
+        .and_then(|directory| dwarf_attr_string(dwarf, unit, directory).transpose())
+        .transpose()?
+        .or_else(|| {
+            unit.comp_dir.as_ref().and_then(|dir| {
+                dir.clone()
+                    .to_string_lossy()
+                    .ok()
+                    .map(|dir| dir.into_owned())
+            })
+        });
+    Ok(Some(match directory {
+        Some(directory) if !directory.is_empty() => {
+            normalize_source_path(&format!("{directory}/{path_name}"))
+        }
+        _ => normalize_source_path(&path_name),
+    }))
+}
+
+fn dwarf_attr_string(
+    dwarf: &gimli::Dwarf<SourceDwarfReader>,
+    unit: &gimli::Unit<SourceDwarfReader>,
+    value: gimli::AttributeValue<SourceDwarfReader>,
+) -> Result<Option<String>> {
+    Ok(Some(
+        dwarf
+            .attr_string(unit, value)?
+            .to_string_lossy()?
+            .into_owned(),
+    ))
+}
+
+pub fn normalize_source_path(path: &str) -> String {
+    let replaced = path.replace('\\', "/");
+    let absolute = replaced.starts_with('/');
+    let mut parts = Vec::new();
+    for part in replaced.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if !parts.is_empty() && parts.last() != Some(&"..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push(part);
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut normalized = parts.join("/");
+    if absolute {
+        normalized.insert(0, '/');
+    }
+    if normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized
+    }
+}
+
+pub fn source_location_changed(origin: &SourceLocation, current: &SourceLocation) -> bool {
+    let origin_file = origin.file.as_deref().map(normalize_source_path);
+    let current_file = current.file.as_deref().map(normalize_source_path);
+    origin_file != current_file || origin.line != current.line
+}
+
+pub fn format_source_location_short(source: &SourceLocation) -> String {
+    match (source.file.as_deref(), source.line) {
+        (Some(file), Some(line)) => format!("{}:{line}", normalize_source_path(file)),
+        (Some(file), None) => normalize_source_path(file),
+        (None, Some(line)) => format!(":{line}"),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
+pub fn format_source_location_delta(origin: &SourceLocation, current: &SourceLocation) -> String {
+    let origin_file = origin.file.as_deref().map(normalize_source_path);
+    let current_file = current.file.as_deref().map(normalize_source_path);
+    match (origin_file, current_file, current.line) {
+        (Some(origin_file), Some(current_file), Some(line)) if origin_file == current_file => {
+            format!(":{line}")
+        }
+        (_, _, _) => format_source_location_short(current),
+    }
+}
+
+pub fn select_source_path_candidates<'a>(
+    rows: &'a [SourceLineRow],
+    requested_path: &str,
+) -> Result<Vec<&'a SourceLineRow>> {
+    let requested = normalize_source_path(requested_path);
+    let mut exact = rows
+        .iter()
+        .filter(|row| normalize_source_path(&row.path) == requested)
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        exact.sort_by_key(|row| (row.path.as_str(), row.line, row.address));
+        return Ok(exact);
+    }
+
+    let suffix = format!("/{requested}");
+    let mut suffix_matches = rows
+        .iter()
+        .filter(|row| normalize_source_path(&row.path).ends_with(&suffix))
+        .collect::<Vec<_>>();
+    if !suffix_matches.is_empty() {
+        let suffix_paths = suffix_matches
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if suffix_paths.len() > 1 {
+            let candidates = suffix_paths
+                .iter()
+                .take(5)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("ambiguous source path {requested_path}; candidates: {candidates}");
+        }
+        suffix_matches.sort_by_key(|row| (row.path.as_str(), row.line, row.address));
+        return Ok(suffix_matches);
+    }
+
+    let requested_basename = Path::new(&requested)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(requested.as_str());
+    let basename_paths = rows
+        .iter()
+        .filter(|row| {
+            Path::new(&row.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(requested_basename)
+        })
+        .map(|row| row.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if basename_paths.len() == 1 {
+        return Ok(rows
+            .iter()
+            .filter(|row| basename_paths.contains(row.path.as_str()))
+            .collect());
+    }
+    if basename_paths.len() > 1 {
+        let candidates = basename_paths
+            .iter()
+            .take(5)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("ambiguous source path {requested_path}; candidates: {candidates}");
+    }
+
+    bail!("source breakpoints currently support the target executable only");
 }
 
 fn load_dwarf_section(
@@ -710,12 +1006,13 @@ where
         |_, _, _, _| Ok(()),
         |_| Ok(()),
         |_, _, _| Ok(()),
+        |_, _| Ok(()),
         TraceWaitMode::Blocking,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn trace_heap_with_status_mode_profile_session_live_control<F, S, C, T, R, U, I>(
+pub fn trace_heap_with_status_mode_profile_session_live_control<F, S, C, T, R, U, I, M>(
     program: &str,
     args: &[String],
     on_event: F,
@@ -737,6 +1034,7 @@ pub fn trace_heap_with_status_mode_profile_session_live_control<F, S, C, T, R, U
     on_register_snapshot: R,
     on_user_breakpoints: U,
     on_code_inspection: I,
+    on_memory_inspection: M,
 ) -> Result<()>
 where
     F: FnMut(HeapTraceEvent, TraceHeapContext) -> Result<AllocatorEventControl>,
@@ -752,6 +1050,7 @@ where
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
     U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
     I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
+    M: FnMut(MemoryInspectionRequest, Pid) -> Result<()>,
 {
     trace_heap_with_status_mode_profile_session_control(
         program,
@@ -775,12 +1074,13 @@ where
         on_register_snapshot,
         on_user_breakpoints,
         on_code_inspection,
+        on_memory_inspection,
         TraceWaitMode::Controlled,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn trace_heap_with_status_mode_profile_session_control<F, S, C, T, R, U, I>(
+fn trace_heap_with_status_mode_profile_session_control<F, S, C, T, R, U, I, M>(
     program: &str,
     args: &[String],
     on_event: F,
@@ -802,6 +1102,7 @@ fn trace_heap_with_status_mode_profile_session_control<F, S, C, T, R, U, I>(
     on_register_snapshot: R,
     on_user_breakpoints: U,
     on_code_inspection: I,
+    on_memory_inspection: M,
     wait_mode: TraceWaitMode,
 ) -> Result<()>
 where
@@ -818,6 +1119,7 @@ where
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
     U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
     I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
+    M: FnMut(MemoryInspectionRequest, Pid) -> Result<()>,
 {
     let launch_config = LaunchConfig {
         target_program: PathBuf::from(program),
@@ -864,6 +1166,7 @@ where
                 on_register_snapshot,
                 on_user_breakpoints,
                 on_code_inspection,
+                on_memory_inspection,
                 wait_mode,
             )
         }
@@ -1018,7 +1321,7 @@ fn run_child(target: TargetCommand) -> Result<()> {
     unreachable!("execvp only returns on error");
 }
 
-fn run_parent_trace_heap<F, C, T, R, I>(
+fn run_parent_trace_heap<F, C, T, R, I, M>(
     child: Pid,
     exec_plan: ExecPlan,
     trace_mode: AllocationTraceMode,
@@ -1033,6 +1336,7 @@ fn run_parent_trace_heap<F, C, T, R, I>(
     mut on_register_snapshot: R,
     mut on_user_breakpoints: impl FnMut(Vec<UserBreakpoint>) -> Result<()>,
     mut on_code_inspection: I,
+    mut on_memory_inspection: M,
     wait_mode: TraceWaitMode,
 ) -> Result<()>
 where
@@ -1047,6 +1351,7 @@ where
     ) -> Result<()>,
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
     I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
+    M: FnMut(MemoryInspectionRequest, Pid) -> Result<()>,
 {
     wait_for_initial_stop_with_status(child, show_status)?;
     let program_path = exec_plan
@@ -1168,6 +1473,7 @@ where
     let mut pending_pause_command_id = None;
     let mut pending_step_command_id = None;
     let mut pending_nexti = None;
+    let mut pending_source_step: Option<SourceStepState> = None;
     let mut stop_requested_at = None;
     loop {
         if matches!(wait_mode, TraceWaitMode::Controlled) {
@@ -1182,12 +1488,15 @@ where
                 &mut pending_pause_command_id,
                 &mut pending_step_command_id,
                 &mut pending_nexti,
+                &mut pending_source_step,
                 &mut stop_requested_at,
                 &mut breakpoints,
+                &mut state,
                 &program_path,
                 &mut on_register_snapshot,
                 &mut on_user_breakpoints,
                 &mut on_code_inspection,
+                &mut on_memory_inspection,
             )? == LiveControlOutcome::TargetExited
             {
                 print_missing_libc_metadata_at_trace_end(&mut state);
@@ -1328,6 +1637,7 @@ where
                                 primary.location_line()
                             );
                             run_mode = LiveTraceRunMode::Continuous;
+                            pending_source_step = None;
                             pending_step_command_id.take();
                             paused = true;
                             pause_requested = false;
@@ -1393,6 +1703,7 @@ where
                                         format!("nexti interrupted: break condition matched after event #{event_id}"),
                                     )?;
                                 }
+                                pending_source_step = None;
                             }
                         }
                     }
@@ -1407,12 +1718,15 @@ where
                         &mut pending_pause_command_id,
                         &mut pending_step_command_id,
                         &mut pending_nexti,
+                        &mut pending_source_step,
                         &mut stop_requested_at,
                         &mut breakpoints,
+                        &mut state,
                         &program_path,
                         &mut on_register_snapshot,
                         &mut on_user_breakpoints,
                         &mut on_code_inspection,
+                        &mut on_memory_inspection,
                     )? == LiveControlOutcome::TargetExited
                     {
                         print_missing_libc_metadata_at_trace_end(&mut state);
@@ -1486,6 +1800,7 @@ where
                         ),
                     )?;
                 } else {
+                    pending_source_step = None;
                     ptrace::cont(child, signal_to_deliver(signal))
                         .with_context(|| format!("failed to continue child after {signal:?}"))?;
                 }
@@ -1503,7 +1818,7 @@ where
     }
 }
 
-fn handle_live_trace_controls<C, T, R, U, I>(
+fn handle_live_trace_controls<C, T, R, U, I, M, F>(
     child: Pid,
     poll_control: &mut C,
     on_control_status: &mut T,
@@ -1514,12 +1829,15 @@ fn handle_live_trace_controls<C, T, R, U, I>(
     pending_pause_command_id: &mut Option<LiveCommandId>,
     pending_step_command_id: &mut Option<LiveCommandId>,
     pending_nexti: &mut Option<PendingInstructionStepOver>,
+    pending_source_step: &mut Option<SourceStepState>,
     stop_requested_at: &mut Option<Instant>,
     breakpoints: &mut BreakpointManager,
+    state: &mut TraceHeapState<F>,
     program_path: &str,
     on_register_snapshot: &mut R,
     on_user_breakpoints: &mut U,
     on_code_inspection: &mut I,
+    on_memory_inspection: &mut M,
 ) -> Result<LiveControlOutcome>
 where
     C: FnMut() -> Option<LiveCommandMessage>,
@@ -1533,6 +1851,8 @@ where
     R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
     U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
     I: FnMut(u64, Option<UserBreakpointId>, Pid) -> Result<()>,
+    M: FnMut(MemoryInspectionRequest, Pid) -> Result<()>,
+    F: FnMut(HeapTraceEvent, TraceHeapContext) -> Result<AllocatorEventControl>,
 {
     while let Some(message) = poll_control() {
         let command = message.command.clone();
@@ -1599,6 +1919,57 @@ where
                     )?,
                 }
             }
+            LiveCommand::InspectMemory(request) => {
+                let pause_state = LiveWorkerPauseState {
+                    ptrace_stopped: *paused,
+                    user_visible_paused: *target_status == LiveTargetStatus::Paused,
+                    step_in_flight: None,
+                    temporary_return_breakpoint_in_flight: breakpoints
+                        .has_temporary_return_breakpoints(),
+                    managed_breakpoints_rearmed: breakpoints.all_breakpoints_rearmed(),
+                };
+                if let Err(reason) = pause_state.can_user_step_instruction() {
+                    on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Rejected,
+                        *target_status,
+                        reason,
+                    )?;
+                    continue;
+                }
+                on_control_status(
+                    Some(message.id),
+                    Some(command.clone()),
+                    LiveCommandStatus::Accepted,
+                    *target_status,
+                    format!("inspecting memory at 0x{:x}", request.address),
+                )?;
+                match on_memory_inspection(request.clone(), child) {
+                    Ok(()) => on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Completed,
+                        *target_status,
+                        format!(
+                            "inspected {} {} at 0x{:x}",
+                            request.count,
+                            match request.format {
+                                MemoryViewFormat::HexWords => "words",
+                                MemoryViewFormat::HexBytes => "bytes",
+                            },
+                            request.address
+                        ),
+                    )?,
+                    Err(err) => on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Failed,
+                        *target_status,
+                        format!("memory inspection failed: {err}"),
+                    )?,
+                }
+            }
             LiveCommand::AddUserBreakpointAddress(addr) => {
                 let symbolizer = ProcessSymbolizer::from_process(child, program_path).ok();
                 let source_mapper = TargetSourceMapper::from_process(child, program_path).ok();
@@ -1623,6 +1994,7 @@ where
                     label,
                     resolved_symbol,
                     source,
+                    None,
                 );
                 complete_breakpoint_management_command(
                     result,
@@ -1663,6 +2035,7 @@ where
                             label,
                             resolved_symbol,
                             source,
+                            None,
                         )
                     });
                 complete_breakpoint_management_command(
@@ -1678,6 +2051,80 @@ where
                             "breakpoint {} set at {}",
                             breakpoint.id.as_u64(),
                             breakpoint.location_line()
+                        )
+                    },
+                )?;
+            }
+            LiveCommand::AddUserBreakpointSourceLine { path, line } => {
+                let result = target_runtime_load_bias(child, program_path)
+                    .and_then(|load_bias| {
+                        resolve_source_line_breakpoint(
+                            Path::new(program_path),
+                            load_bias,
+                            &path,
+                            line,
+                        )
+                    })
+                    .and_then(|resolution| {
+                        let symbolizer = ProcessSymbolizer::from_process(child, program_path).ok();
+                        let source_mapper =
+                            TargetSourceMapper::from_process(child, program_path).ok();
+                        let (resolved_symbol, source) = symbolizer
+                            .as_ref()
+                            .map(|symbolizer| {
+                                symbolizer.breakpoint_metadata(
+                                    resolution.resolved_address,
+                                    source_mapper.as_ref(),
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                (
+                                    resolution.symbol.clone(),
+                                    Some(SourceLocation {
+                                        file: Some(resolution.resolved_path.clone()),
+                                        line: u32::try_from(resolution.resolved_line).ok(),
+                                        column: None,
+                                    }),
+                                )
+                            });
+                        let label = resolved_symbol.clone().unwrap_or_else(|| {
+                            format!("{}:{}", resolution.resolved_path, resolution.resolved_line)
+                        });
+                        breakpoints.add_user_breakpoint(
+                            child,
+                            UserBreakpointSpec::SourceLine {
+                                path: path.clone(),
+                                line,
+                            },
+                            resolution.resolved_address,
+                            label,
+                            resolved_symbol.or_else(|| resolution.symbol.clone()),
+                            source.or_else(|| {
+                                Some(SourceLocation {
+                                    file: Some(resolution.resolved_path.clone()),
+                                    line: u32::try_from(resolution.resolved_line).ok(),
+                                    column: None,
+                                })
+                            }),
+                            Some(resolution),
+                        )
+                    });
+                complete_breakpoint_management_command(
+                    result,
+                    message.id,
+                    command,
+                    *target_status,
+                    breakpoints,
+                    on_control_status,
+                    on_user_breakpoints,
+                    |breakpoint| {
+                        let source = breakpoint
+                            .source_summary()
+                            .unwrap_or_else(|| breakpoint.label.clone());
+                        format!(
+                            "breakpoint {} set at 0x{:x} ({source})",
+                            breakpoint.id.as_u64(),
+                            breakpoint.resolved_address
                         )
                     },
                 )?;
@@ -1878,6 +2325,135 @@ where
                         }
                     }
                 }
+            }
+            LiveCommand::SourceStep | LiveCommand::SourceStepOver => {
+                let kind = if matches!(command, LiveCommand::SourceStepOver) {
+                    SourceStepKind::Over
+                } else {
+                    SourceStepKind::Into
+                };
+                let status = if kind == SourceStepKind::Over {
+                    LiveTargetStatus::SourceSteppingOver
+                } else {
+                    LiveTargetStatus::SourceStepping
+                };
+                let pause_state = LiveWorkerPauseState {
+                    ptrace_stopped: *paused,
+                    user_visible_paused: *target_status == LiveTargetStatus::Paused,
+                    step_in_flight: None,
+                    temporary_return_breakpoint_in_flight: breakpoints
+                        .has_temporary_return_breakpoints(),
+                    managed_breakpoints_rearmed: breakpoints.all_breakpoints_rearmed(),
+                };
+                if let Err(reason) = pause_state.can_user_step_instruction() {
+                    on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Rejected,
+                        *target_status,
+                        reason,
+                    )?;
+                    continue;
+                }
+                let snapshot = match read_register_snapshot(child) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        on_control_status(
+                            Some(message.id),
+                            Some(command.clone()),
+                            LiveCommandStatus::Failed,
+                            *target_status,
+                            format!("source stepping failed: {err}"),
+                        )?;
+                        continue;
+                    }
+                };
+                let rip = snapshot.instruction_pointer;
+                let executable = find_executable_mapping(child, program_path)?;
+                if !executable
+                    .as_ref()
+                    .map(|mapping| rip >= mapping.start && rip < mapping.end)
+                    .unwrap_or(false)
+                {
+                    on_control_status(
+                        Some(message.id),
+                        Some(command.clone()),
+                        LiveCommandStatus::Rejected,
+                        *target_status,
+                        "source stepping currently supports the target executable only".to_string(),
+                    )?;
+                    continue;
+                }
+                let source_mapper = match TargetSourceMapper::from_process(child, program_path) {
+                    Ok(mapper) => mapper,
+                    Err(_) => {
+                        on_control_status(
+                            Some(message.id),
+                            Some(command.clone()),
+                            LiveCommandStatus::Rejected,
+                            *target_status,
+                            "source stepping requires DWARF source information for the current target location".to_string(),
+                        )?;
+                        continue;
+                    }
+                };
+                let origin = match source_mapper.lookup(rip) {
+                    Some(source) => source,
+                    None => {
+                        on_control_status(
+                            Some(message.id),
+                            Some(command.clone()),
+                            LiveCommandStatus::Rejected,
+                            *target_status,
+                            "source stepping requires DWARF source information for the current target location".to_string(),
+                        )?;
+                        continue;
+                    }
+                };
+                *target_status = status;
+                *run_mode = match kind {
+                    SourceStepKind::Into => LiveTraceRunMode::SourceStepInto,
+                    SourceStepKind::Over => LiveTraceRunMode::SourceStepOver,
+                };
+                *pending_source_step = Some(SourceStepState {
+                    kind,
+                    origin: origin.clone(),
+                    origin_rip: rip,
+                    instructions_executed: 0,
+                    instruction_budget: DEFAULT_SOURCE_STEP_BUDGET,
+                });
+                on_control_status(
+                    Some(message.id),
+                    Some(command.clone()),
+                    LiveCommandStatus::Accepted,
+                    *target_status,
+                    match kind {
+                        SourceStepKind::Into => format!(
+                            "stepping to next source location from {}",
+                            format_source_location_short(&origin)
+                        ),
+                        SourceStepKind::Over => format!(
+                            "stepping over to next source location from {}",
+                            format_source_location_short(&origin)
+                        ),
+                    },
+                )?;
+                let result = run_source_step_to_completion(
+                    child,
+                    message.id,
+                    command.clone(),
+                    pending_source_step,
+                    &source_mapper,
+                    breakpoints,
+                    state,
+                    on_register_snapshot,
+                    on_user_breakpoints,
+                    on_control_status,
+                )?;
+                *paused = true;
+                *pause_requested = false;
+                *target_status = result;
+                *run_mode = LiveTraceRunMode::Continuous;
             }
             LiveCommand::StepInstruction => {
                 let pause_state = LiveWorkerPauseState {
@@ -2233,6 +2809,406 @@ fn should_continue_after_allocator_event(run_mode: LiveTraceRunMode) -> bool {
         run_mode,
         LiveTraceRunMode::Continuous | LiveTraceRunMode::UserInstructionStepOver
     )
+}
+
+fn run_source_step_to_completion<R, U, T, F>(
+    child: Pid,
+    command_id: LiveCommandId,
+    command: LiveCommand,
+    source_step: &mut Option<SourceStepState>,
+    source_mapper: &TargetSourceMapper,
+    breakpoints: &mut BreakpointManager,
+    state: &mut TraceHeapState<F>,
+    on_register_snapshot: &mut R,
+    on_user_breakpoints: &mut U,
+    on_control_status: &mut T,
+) -> Result<LiveTargetStatus>
+where
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
+    T: FnMut(
+        Option<LiveCommandId>,
+        Option<LiveCommand>,
+        LiveCommandStatus,
+        LiveTargetStatus,
+        String,
+    ) -> Result<()>,
+    F: FnMut(HeapTraceEvent, TraceHeapContext) -> Result<AllocatorEventControl>,
+{
+    loop {
+        let Some(step) = source_step.as_mut() else {
+            return Ok(LiveTargetStatus::Paused);
+        };
+        if step.instructions_executed >= step.instruction_budget {
+            let instructions = step.instructions_executed;
+            source_step.take();
+            emit_register_snapshot_best_effort(
+                child,
+                None,
+                on_register_snapshot,
+                on_control_status,
+                LiveTargetStatus::Paused,
+            )?;
+            on_control_status(
+                Some(command_id),
+                Some(command),
+                LiveCommandStatus::Completed,
+                LiveTargetStatus::Paused,
+                format!("source-step limit reached after {instructions} instructions"),
+            )?;
+            return Ok(LiveTargetStatus::Paused);
+        }
+
+        let before_rip = read_register_snapshot(child)?.instruction_pointer;
+        if step.kind == SourceStepKind::Over {
+            let decoded = decode_instruction_at_rip(child, before_rip)?;
+            if decoded.is_call {
+                let fallthrough = decoded_instruction_fallthrough(&decoded);
+                breakpoints.set_user_step_over_breakpoint(
+                    child,
+                    fallthrough,
+                    command_id,
+                    before_rip,
+                )?;
+                ptrace::cont(child, None).context("failed to continue source-next over call")?;
+                loop {
+                    match waitpid(child, None)
+                        .context("failed waiting for source-next call step-over")?
+                    {
+                        WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {
+                            let hit_addr = ptrace::getregs(child)?.rip.saturating_sub(1);
+                            if hit_addr == fallthrough {
+                                let pending = PendingInstructionStepOver {
+                                    command_id,
+                                    from_rip: before_rip,
+                                    breakpoint_addr: fallthrough,
+                                };
+                                restore_user_step_over_breakpoint_hit(child, breakpoints, pending)?;
+                                break;
+                            }
+                            if handle_source_step_breakpoint_stop(
+                                child,
+                                hit_addr,
+                                breakpoints,
+                                state,
+                                on_user_breakpoints,
+                                on_register_snapshot,
+                                on_control_status,
+                                command_id,
+                                command.clone(),
+                            )? {
+                                let _ = breakpoints
+                                    .remove_user_step_over_breakpoint(child, fallthrough);
+                                source_step.take();
+                                return Ok(LiveTargetStatus::Paused);
+                            }
+                            ptrace::cont(child, None)
+                                .context("failed to continue during source-next")?;
+                        }
+                        WaitStatus::Stopped(pid, signal) if pid == child => {
+                            let _ =
+                                breakpoints.remove_user_step_over_breakpoint(child, fallthrough);
+                            source_step.take();
+                            emit_register_snapshot_best_effort(
+                                child,
+                                None,
+                                on_register_snapshot,
+                                on_control_status,
+                                LiveTargetStatus::Paused,
+                            )?;
+                            on_control_status(
+                                Some(command_id),
+                                Some(command),
+                                LiveCommandStatus::Failed,
+                                LiveTargetStatus::Paused,
+                                format_instruction_step_signal(
+                                    signal,
+                                    read_register_snapshot(child)
+                                        .ok()
+                                        .map(|snapshot| snapshot.instruction_pointer),
+                                ),
+                            )?;
+                            return Ok(LiveTargetStatus::Paused);
+                        }
+                        WaitStatus::Exited(pid, code) if pid == child => {
+                            source_step.take();
+                            on_control_status(
+                                Some(command_id),
+                                Some(command),
+                                LiveCommandStatus::Completed,
+                                LiveTargetStatus::Exited,
+                                format!("target exited with status {code}"),
+                            )?;
+                            return Ok(LiveTargetStatus::Exited);
+                        }
+                        WaitStatus::Signaled(pid, signal, _) if pid == child => {
+                            source_step.take();
+                            on_control_status(
+                                Some(command_id),
+                                Some(command),
+                                LiveCommandStatus::Completed,
+                                LiveTargetStatus::Exited,
+                                format!("target terminated by signal {signal:?}"),
+                            )?;
+                            return Ok(LiveTargetStatus::Exited);
+                        }
+                        status => bail!("source-next stopped unexpectedly: {status:?}"),
+                    }
+                }
+                step.instructions_executed += 1;
+            } else {
+                ptrace::step(child, None).context("failed to source-next single-step")?;
+                wait_source_step_single_stop(
+                    child,
+                    command_id,
+                    command.clone(),
+                    source_step,
+                    on_register_snapshot,
+                    on_control_status,
+                )?;
+                if source_step.is_none() {
+                    return Ok(LiveTargetStatus::Paused);
+                }
+                source_step.as_mut().unwrap().instructions_executed += 1;
+            }
+        } else {
+            ptrace::step(child, None).context("failed to source-step instruction")?;
+            wait_source_step_single_stop(
+                child,
+                command_id,
+                command.clone(),
+                source_step,
+                on_register_snapshot,
+                on_control_status,
+            )?;
+            if source_step.is_none() {
+                return Ok(LiveTargetStatus::Paused);
+            }
+            source_step.as_mut().unwrap().instructions_executed += 1;
+        }
+
+        let current_rip = read_register_snapshot(child)?.instruction_pointer;
+        if let Some(current) = source_mapper.lookup(current_rip) {
+            let step = source_step.as_ref().unwrap();
+            if source_location_changed(&step.origin, &current) {
+                let origin = step.origin.clone();
+                let instructions = step.instructions_executed;
+                let kind = step.kind;
+                source_step.take();
+                emit_register_snapshot_best_effort(
+                    child,
+                    None,
+                    on_register_snapshot,
+                    on_control_status,
+                    LiveTargetStatus::Paused,
+                )?;
+                let message = match kind {
+                    SourceStepKind::Into => format!(
+                        "source-step: {} -> {} after {} instructions",
+                        format_source_location_short(&origin),
+                        format_source_location_delta(&origin, &current),
+                        instructions
+                    ),
+                    SourceStepKind::Over => format!(
+                        "source-next: {} -> {} after {} instructions",
+                        format_source_location_short(&origin),
+                        format_source_location_delta(&origin, &current),
+                        instructions
+                    ),
+                };
+                on_control_status(
+                    Some(command_id),
+                    Some(command),
+                    LiveCommandStatus::Completed,
+                    LiveTargetStatus::Paused,
+                    message,
+                )?;
+                return Ok(LiveTargetStatus::Paused);
+            }
+        }
+    }
+}
+
+fn wait_source_step_single_stop<R, T>(
+    child: Pid,
+    command_id: LiveCommandId,
+    command: LiveCommand,
+    source_step: &mut Option<SourceStepState>,
+    on_register_snapshot: &mut R,
+    on_control_status: &mut T,
+) -> Result<()>
+where
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    T: FnMut(
+        Option<LiveCommandId>,
+        Option<LiveCommand>,
+        LiveCommandStatus,
+        LiveTargetStatus,
+        String,
+    ) -> Result<()>,
+{
+    match waitpid(child, None).context("failed waiting for source-step stop")? {
+        WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => Ok(()),
+        WaitStatus::Stopped(pid, signal) if pid == child => {
+            source_step.take();
+            emit_register_snapshot_best_effort(
+                child,
+                None,
+                on_register_snapshot,
+                on_control_status,
+                LiveTargetStatus::Paused,
+            )?;
+            on_control_status(
+                Some(command_id),
+                Some(command),
+                LiveCommandStatus::Failed,
+                LiveTargetStatus::Paused,
+                format_instruction_step_signal(
+                    signal,
+                    read_register_snapshot(child)
+                        .ok()
+                        .map(|snapshot| snapshot.instruction_pointer),
+                ),
+            )
+        }
+        WaitStatus::Exited(pid, code) if pid == child => {
+            source_step.take();
+            on_control_status(
+                Some(command_id),
+                Some(command),
+                LiveCommandStatus::Completed,
+                LiveTargetStatus::Exited,
+                format!("target exited with status {code}"),
+            )
+        }
+        WaitStatus::Signaled(pid, signal, _) if pid == child => {
+            source_step.take();
+            on_control_status(
+                Some(command_id),
+                Some(command),
+                LiveCommandStatus::Completed,
+                LiveTargetStatus::Exited,
+                format!("target terminated by signal {signal:?}"),
+            )
+        }
+        status => bail!("source-step stopped unexpectedly: {status:?}"),
+    }
+}
+
+fn handle_source_step_breakpoint_stop<R, U, T, F>(
+    child: Pid,
+    hit_addr: u64,
+    breakpoints: &mut BreakpointManager,
+    state: &mut TraceHeapState<F>,
+    on_user_breakpoints: &mut U,
+    on_register_snapshot: &mut R,
+    on_control_status: &mut T,
+    command_id: LiveCommandId,
+    command: LiveCommand,
+) -> Result<bool>
+where
+    R: FnMut(Option<usize>, RegisterSnapshot, StackSnapshot, Pid) -> Result<()>,
+    U: FnMut(Vec<UserBreakpoint>) -> Result<()>,
+    T: FnMut(
+        Option<LiveCommandId>,
+        Option<LiveCommand>,
+        LiveCommandStatus,
+        LiveTargetStatus,
+        String,
+    ) -> Result<()>,
+    F: FnMut(HeapTraceEvent, TraceHeapContext) -> Result<AllocatorEventControl>,
+{
+    let user_breakpoint_ids = breakpoints.persistent_user_owners_at(hit_addr);
+    if !user_breakpoint_ids.is_empty() {
+        if breakpoints.allocator_owner(hit_addr).is_some() {
+            let _ = handle_managed_breakpoint_hit(child, breakpoints, state)?;
+        } else {
+            handle_persistent_user_breakpoint_step_over(child, breakpoints, hit_addr)?;
+        }
+        let hit_breakpoints = breakpoints.record_user_breakpoint_hits(&user_breakpoint_ids);
+        on_user_breakpoints(breakpoints.list_user_breakpoints())?;
+        if let Some(primary) = hit_breakpoints.first() {
+            emit_register_snapshot_best_effort(
+                child,
+                None,
+                on_register_snapshot,
+                on_control_status,
+                LiveTargetStatus::Paused,
+            )?;
+            on_control_status(
+                Some(command_id),
+                Some(command),
+                LiveCommandStatus::Failed,
+                LiveTargetStatus::Paused,
+                format!(
+                    "source-next interrupted: breakpoint {} hit",
+                    primary.id.as_u64()
+                ),
+            )?;
+            on_control_status(
+                None,
+                None,
+                LiveCommandStatus::Completed,
+                LiveTargetStatus::Paused,
+                format!(
+                    "breakpoint {} hit at {}",
+                    primary.id.as_u64(),
+                    primary.location_line()
+                ),
+            )?;
+            return Ok(true);
+        }
+    }
+
+    if let Some((event_id, event_control)) =
+        handle_managed_breakpoint_hit(child, breakpoints, state)?
+    {
+        emit_register_snapshot_best_effort(
+            child,
+            Some(event_id),
+            on_register_snapshot,
+            on_control_status,
+            LiveTargetStatus::SourceSteppingOver,
+        )?;
+        if event_control == AllocatorEventControl::Pause {
+            on_control_status(
+                Some(command_id),
+                Some(command),
+                LiveCommandStatus::Failed,
+                LiveTargetStatus::Paused,
+                format!("source-next interrupted: break condition matched after event #{event_id}"),
+            )?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn restore_user_step_over_breakpoint_hit(
+    child: Pid,
+    manager: &mut BreakpointManager,
+    pending: PendingInstructionStepOver,
+) -> Result<()> {
+    let mut regs = ptrace::getregs(child).context("failed to read child registers")?;
+    let hit_addr = regs.rip.saturating_sub(1);
+    if hit_addr != pending.breakpoint_addr {
+        bail!(
+            "unexpected nexti SIGTRAP at rip=0x{:x} (hit address 0x{:x}, expected 0x{:x})",
+            regs.rip,
+            hit_addr,
+            pending.breakpoint_addr
+        );
+    }
+    regs.rip = hit_addr;
+    ptrace::setregs(child, regs).context("failed to restore RIP after nexti breakpoint")?;
+    manager.remove_user_step_over_breakpoint(child, hit_addr)?;
+    if let Some(managed) = manager.get_mut(hit_addr) {
+        managed
+            .breakpoint
+            .enable(child)
+            .with_context(|| format!("failed to re-enable breakpoint at 0x{hit_addr:x}"))?;
+    }
+    Ok(())
 }
 
 fn complete_breakpoint_management_command<T, U>(
@@ -2952,7 +3928,7 @@ pub fn read_word(pid: Pid, addr: u64) -> Result<u64> {
     Ok(word as u64)
 }
 
-fn read_process_memory(pid: Pid, address: u64, size: usize) -> Result<Vec<u8>> {
+pub fn read_target_memory(pid: Pid, address: u64, size: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(size);
     let mut offset = 0usize;
     while offset < size {
@@ -5171,13 +6147,15 @@ mod tests {
         read_disassembly_snapshot_with_reader, read_fastbin_chain,
         register_snapshot_from_x86_64_regs, regular_bin_snapshot_limit,
         return_address_source_lookup_addr, runtime_addr_to_source_relative_addr,
-        runtime_objects_from_mappings, runtime_symbol_addr, should_continue_after_allocator_event,
-        should_pause_after_allocator_event, suggested_glibc_profile_hint_lines, write_all_to_fd,
-        AllocationTraceMode, AllocatorEventControl, Breakpoint, BreakpointManager, BreakpointOwner,
-        BreakpointPurpose, DebuggerStopReason, DisassemblyFlowControl, LaunchConfig, LaunchMode,
-        LibcMetadata, LiveCommand, LiveCommandId, LiveTargetStatus, LiveTraceRunMode,
-        LiveWorkerPauseState, ManagedBreakpoint, MemoryMapping, ProcessSymbolizer, RegisterArch,
-        RegisterRole, RuntimeSymbol, StdinConfig, StepKind, TargetMemoryReader, TargetSymbolizer,
+        runtime_objects_from_mappings, runtime_symbol_addr, select_source_path_candidates,
+        should_continue_after_allocator_event, should_pause_after_allocator_event,
+        signal_to_deliver, suggested_glibc_profile_hint_lines, target_runtime_load_bias,
+        trace_heap_with_status, write_all_to_fd, AllocationTraceMode, AllocatorEventControl,
+        Breakpoint, BreakpointManager, BreakpointOwner, BreakpointPurpose, DebuggerStopReason,
+        DisassemblyFlowControl, LaunchConfig, LaunchMode, LibcMetadata, LiveCommand, LiveCommandId,
+        LiveTargetStatus, LiveTraceRunMode, LiveWorkerPauseState, ManagedBreakpoint, MemoryMapping,
+        ProcessSymbolizer, RegisterArch, RegisterRole, RuntimeSymbol, SourceBreakpointResolution,
+        SourceLineRow, SourceLocation, StdinConfig, StepKind, TargetMemoryReader, TargetSymbolizer,
         TraceHeapState, UserBreakpoint, UserBreakpointId, UserBreakpointSpec,
     };
     use heapify_core::glibc::{
@@ -5186,7 +6164,11 @@ mod tests {
         GLIBC_X86_64_MODERN,
     };
     use heapify_core::tracker::HeapTracker;
+    use nix::sys::ptrace;
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::{waitpid, WaitStatus};
     use nix::unistd::Pid;
+    use nix::unistd::{execvp, fork, ForkResult};
     use std::path::{Path, PathBuf};
 
     struct SliceMemoryReader {
@@ -5404,6 +6386,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_live_command_allows_source_commands_only_while_paused() {
+        for command in [LiveCommand::SourceStep, LiveCommand::SourceStepOver] {
+            assert!(
+                super::validate_live_command(LiveTargetStatus::Paused, command.clone()).is_ok()
+            );
+            for status in [
+                LiveTargetStatus::NotStarted,
+                LiveTargetStatus::Running,
+                LiveTargetStatus::SteppingToNextAllocatorEvent,
+                LiveTargetStatus::SteppingInstruction,
+                LiveTargetStatus::SteppingInstructionOver,
+                LiveTargetStatus::SourceStepping,
+                LiveTargetStatus::SourceSteppingOver,
+                LiveTargetStatus::Stopping,
+                LiveTargetStatus::Exited,
+            ] {
+                assert!(super::validate_live_command(status, command.clone()).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn validate_live_command_allows_inspect_code_only_while_paused() {
         let command = LiveCommand::InspectCodeAt {
             address: 0x4011a5,
@@ -5493,6 +6497,68 @@ mod tests {
             .summary_line(),
             "breakpoint 2 hit at 0x4011a5 (main+0x37)"
         );
+        assert_eq!(
+            DebuggerStopReason::SourceStep {
+                from: SourceLocation {
+                    file: Some("src/main.c".to_string()),
+                    line: Some(12),
+                    column: Some(1),
+                },
+                to: SourceLocation {
+                    file: Some("src/main.c".to_string()),
+                    line: Some(13),
+                    column: Some(9),
+                },
+                instructions_executed: 8,
+            }
+            .summary_line(),
+            "source-step: src/main.c:12 -> :13 after 8 instructions"
+        );
+        assert_eq!(
+            DebuggerStopReason::SourceStepLimit {
+                from: SourceLocation {
+                    file: Some("src/main.c".to_string()),
+                    line: Some(12),
+                    column: None,
+                },
+                instructions_executed: 10000,
+            }
+            .summary_line(),
+            "source-step limit reached after 10000 instructions"
+        );
+    }
+
+    #[test]
+    fn source_location_changed_uses_file_and_line_only() {
+        let origin = SourceLocation {
+            file: Some("src/./main.c".to_string()),
+            line: Some(12),
+            column: Some(1),
+        };
+        assert!(!super::source_location_changed(
+            &origin,
+            &SourceLocation {
+                file: Some("src/main.c".to_string()),
+                line: Some(12),
+                column: Some(9),
+            }
+        ));
+        assert!(super::source_location_changed(
+            &origin,
+            &SourceLocation {
+                file: Some("src/main.c".to_string()),
+                line: Some(13),
+                column: Some(1),
+            }
+        ));
+        assert!(super::source_location_changed(
+            &origin,
+            &SourceLocation {
+                file: Some("src/other.c".to_string()),
+                line: Some(12),
+                column: Some(1),
+            }
+        ));
     }
 
     #[test]
@@ -5698,6 +6764,7 @@ mod tests {
                 "main".to_string(),
                 None,
                 None,
+                None,
             )
             .unwrap();
         let second = manager
@@ -5706,6 +6773,7 @@ mod tests {
                 UserBreakpointSpec::Address(0x401005),
                 0x401005,
                 "main+0x1".to_string(),
+                None,
                 None,
                 None,
             )
@@ -5719,6 +6787,7 @@ mod tests {
                 UserBreakpointSpec::Address(0x401005),
                 0x401005,
                 "main+0x2".to_string(),
+                None,
                 None,
                 None,
             )
@@ -5739,6 +6808,7 @@ mod tests {
                 UserBreakpointSpec::Address(0x401005),
                 0x401005,
                 "main".to_string(),
+                None,
                 None,
                 None,
             )
@@ -5765,6 +6835,7 @@ mod tests {
                 UserBreakpointSpec::Address(0x401005),
                 0x401005,
                 "main".to_string(),
+                None,
                 None,
                 None,
             )
@@ -5794,6 +6865,7 @@ mod tests {
                 "main".to_string(),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -5821,6 +6893,7 @@ mod tests {
                 UserBreakpointSpec::Address(0x401005),
                 0x401005,
                 "main".to_string(),
+                None,
                 None,
                 None,
             )
@@ -5862,12 +6935,52 @@ mod tests {
             label: "main+0x37".to_string(),
             resolved_symbol: Some("main+0x37".to_string()),
             source: None,
+            source_resolution: None,
         };
 
         assert_eq!(breakpoint.location_line(), "0x4011a5 (main+0x37)");
         assert_eq!(
             breakpoint.summary_line(),
             "2    y   3      0x4011a5 main+0x37"
+        );
+    }
+
+    #[test]
+    fn user_breakpoint_source_summary_is_used_in_location_line() {
+        let breakpoint = UserBreakpoint {
+            id: UserBreakpointId(3),
+            spec: UserBreakpointSpec::SourceLine {
+                path: "main.c".to_string(),
+                line: 12,
+            },
+            resolved_address: 0x4011a1,
+            enabled: true,
+            hit_count: 0,
+            label: "main+0x33".to_string(),
+            resolved_symbol: Some("main+0x33".to_string()),
+            source: None,
+            source_resolution: Some(SourceBreakpointResolution {
+                requested_path: "main.c".to_string(),
+                requested_line: 12,
+                resolved_path: "examples/simple_malloc.c".to_string(),
+                resolved_line: 12,
+                resolved_address: 0x4011a1,
+                symbol: Some("main+0x33".to_string()),
+            }),
+        };
+
+        assert_eq!(
+            breakpoint.location_line(),
+            "0x4011a1 (examples/simple_malloc.c:12; main+0x33)"
+        );
+        assert_eq!(
+            DebuggerStopReason::UserBreakpoint {
+                breakpoint_id: UserBreakpointId(3),
+                address: breakpoint.resolved_address,
+                label: "examples/simple_malloc.c:12 (main+0x33)".to_string(),
+            }
+            .summary_line(),
+            "breakpoint 3 hit at 0x4011a1 (examples/simple_malloc.c:12 (main+0x33))"
         );
     }
 
@@ -5887,6 +7000,168 @@ mod tests {
             },
         );
         manager
+    }
+
+    #[test]
+    #[ignore = "ptrace integration test; run via scripts/test-integration.sh on Linux x86-64"]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn source_breakpoint_resolves_for_pie_and_non_pie_fixtures() {
+        let fixture = compile_source_breakpoint_fixture("resolve", false);
+        let non_pie = compile_source_breakpoint_fixture("resolve-nopie", true);
+
+        let pie_resolution =
+            super::resolve_source_line_breakpoint(&fixture.binary, 0x5555_0000, "source_bp.c", 6)
+                .unwrap();
+        let non_pie_resolution =
+            super::resolve_source_line_breakpoint(&non_pie.binary, 0, "source_bp.c", 6).unwrap();
+
+        assert_eq!(pie_resolution.resolved_line, 6);
+        assert!(pie_resolution.resolved_address >= 0x5555_0000);
+        assert_eq!(non_pie_resolution.resolved_line, 6);
+        assert!(non_pie_resolution.resolved_address < 0x5555_0000);
+    }
+
+    #[test]
+    #[ignore = "ptrace integration test; run via scripts/test-integration.sh on Linux x86-64"]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn source_breakpoint_hits_and_allocator_tracing_continues() {
+        let fixture = compile_source_breakpoint_fixture("hit", false);
+        let child = spawn_traced_fixture(&fixture.binary);
+        let load_bias = target_runtime_load_bias(child, fixture.binary.to_str().unwrap()).unwrap();
+        let resolution =
+            super::resolve_source_line_breakpoint(&fixture.binary, load_bias, "source_bp.c", 6)
+                .unwrap();
+        let mut breakpoint = Breakpoint::new(resolution.resolved_address);
+        breakpoint.enable(child).unwrap();
+
+        ptrace::cont(child, None).unwrap();
+        let hit = wait_for_source_breakpoint_hit(child, resolution.resolved_address);
+        assert!(hit, "source breakpoint did not hit");
+
+        breakpoint.disable(child).unwrap();
+        let mut regs = ptrace::getregs(child).unwrap();
+        regs.rip = resolution.resolved_address;
+        ptrace::setregs(child, regs).unwrap();
+        ptrace::cont(child, None).unwrap();
+        wait_for_fixture_exit(child);
+
+        let mut events = 0usize;
+        trace_heap_with_status(
+            fixture.binary.to_str().unwrap(),
+            &[],
+            |_event, _context| {
+                events += 1;
+                Ok(())
+            },
+            false,
+        )
+        .unwrap();
+        assert!(events >= 1, "allocator tracing produced no events");
+    }
+
+    #[test]
+    #[ignore = "ptrace integration test; run via scripts/test-integration.sh on Linux x86-64"]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn disabled_source_breakpoint_does_not_stop() {
+        let fixture = compile_source_breakpoint_fixture("disabled", false);
+        let child = spawn_traced_fixture(&fixture.binary);
+        let load_bias = target_runtime_load_bias(child, fixture.binary.to_str().unwrap()).unwrap();
+        let resolution =
+            super::resolve_source_line_breakpoint(&fixture.binary, load_bias, "source_bp.c", 6)
+                .unwrap();
+        let mut breakpoint = Breakpoint::new(resolution.resolved_address);
+        breakpoint.enable(child).unwrap();
+        breakpoint.disable(child).unwrap();
+
+        ptrace::cont(child, None).unwrap();
+
+        assert!(!wait_for_source_breakpoint_hit(
+            child,
+            resolution.resolved_address
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    struct SourceBreakpointFixture {
+        binary: std::path::PathBuf,
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn compile_source_breakpoint_fixture(name: &str, no_pie: bool) -> SourceBreakpointFixture {
+        let dir =
+            std::env::temp_dir().join(format!("heapify-source-bp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source_bp.c");
+        let binary = dir.join("source_bp");
+        std::fs::write(
+            &source,
+            "#include <stdlib.h>\n#include <unistd.h>\n\nint main(void) {\n    sleep(1);\n    void *p = malloc(0x30);\n    free(p);\n    return 0;\n}\n",
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("gcc");
+        command.args(["-g", "-O0", "-fno-omit-frame-pointer"]);
+        if no_pie {
+            command.arg("-no-pie");
+        }
+        let status = command
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        SourceBreakpointFixture { binary }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn spawn_traced_fixture(binary: &std::path::Path) -> Pid {
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                ptrace::traceme().unwrap();
+                let program = std::ffi::CString::new(binary.to_str().unwrap()).unwrap();
+                execvp(&program, &[program.clone()]).unwrap();
+                unreachable!();
+            }
+            ForkResult::Parent { child } => match waitpid(child, None).unwrap() {
+                WaitStatus::Stopped(pid, _) if pid == child => child,
+                status => panic!("unexpected initial wait status: {status:?}"),
+            },
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn wait_for_source_breakpoint_hit(child: Pid, expected_address: u64) -> bool {
+        loop {
+            match waitpid(child, None).unwrap() {
+                WaitStatus::Stopped(pid, Signal::SIGTRAP) if pid == child => {
+                    let regs = ptrace::getregs(child).unwrap();
+                    return regs.rip.saturating_sub(1) == expected_address;
+                }
+                WaitStatus::Stopped(pid, signal) if pid == child => {
+                    ptrace::cont(child, signal_to_deliver(signal)).unwrap();
+                }
+                WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) if pid == child => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn wait_for_fixture_exit(child: Pid) {
+        loop {
+            match waitpid(child, None).unwrap() {
+                WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) if pid == child => {
+                    return;
+                }
+                WaitStatus::Stopped(pid, signal) if pid == child => {
+                    ptrace::cont(child, signal_to_deliver(signal)).unwrap();
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -6165,6 +7440,66 @@ mod tests {
             None
         );
         assert_eq!(return_address_source_lookup_addr(0), 0);
+    }
+
+    #[test]
+    fn source_path_matching_prefers_exact_normalized_path() {
+        let rows = source_rows();
+
+        let selected = select_source_path_candidates(&rows, "/tmp/project/src/./main.c").unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].path, "/tmp/project/src/main.c");
+    }
+
+    #[test]
+    fn source_path_matching_accepts_exact_suffix() {
+        let rows = source_rows();
+
+        let selected = select_source_path_candidates(&rows, "project/src/main.c").unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].path, "/tmp/project/src/main.c");
+    }
+
+    #[test]
+    fn source_path_matching_accepts_unambiguous_basename() {
+        let rows = source_rows();
+
+        let selected = select_source_path_candidates(&rows, "helper.c").unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].path, "/tmp/project/lib/helper.c");
+    }
+
+    #[test]
+    fn source_path_matching_rejects_ambiguous_basename() {
+        let rows = source_rows();
+
+        let error = select_source_path_candidates(&rows, "main.c").unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous source path"));
+        assert!(error.to_string().contains("/tmp/project/src/main.c"));
+    }
+
+    fn source_rows() -> Vec<SourceLineRow> {
+        vec![
+            SourceLineRow {
+                path: "/tmp/project/src/main.c".to_string(),
+                line: 42,
+                address: 0x1000,
+            },
+            SourceLineRow {
+                path: "/tmp/other/main.c".to_string(),
+                line: 7,
+                address: 0x2000,
+            },
+            SourceLineRow {
+                path: "/tmp/project/lib/helper.c".to_string(),
+                line: 3,
+                address: 0x3000,
+            },
+        ]
     }
 
     #[test]

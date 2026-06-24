@@ -181,7 +181,7 @@ struct PtraceMemoryReader {
 
 impl TargetMemoryReader for PtraceMemoryReader {
     fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>> {
-        read_process_memory(self.pid, address, size)
+        read_target_memory(self.pid, address, size)
     }
 }
 

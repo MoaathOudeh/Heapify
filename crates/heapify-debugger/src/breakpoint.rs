@@ -13,6 +13,17 @@ impl UserBreakpointId {
 pub enum UserBreakpointSpec {
     Address(u64),
     Symbol(String),
+    SourceLine { path: String, line: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBreakpointResolution {
+    pub requested_path: String,
+    pub requested_line: u64,
+    pub resolved_path: String,
+    pub resolved_line: u64,
+    pub resolved_address: u64,
+    pub symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +36,7 @@ pub struct UserBreakpoint {
     pub label: String,
     pub resolved_symbol: Option<String>,
     pub source: Option<SourceLocation>,
+    pub source_resolution: Option<SourceBreakpointResolution>,
 }
 
 impl UserBreakpoint {
@@ -41,7 +53,26 @@ impl UserBreakpoint {
     }
 
     pub fn location_line(&self) -> String {
+        if let Some(source) = self.source_summary() {
+            if let Some(symbol) = self.resolved_symbol.as_deref() {
+                return format!("0x{:x} ({source}; {symbol})", self.resolved_address);
+            }
+            return format!("0x{:x} ({source})", self.resolved_address);
+        }
         format!("0x{:x} ({})", self.resolved_address, self.label)
+    }
+
+    pub fn source_summary(&self) -> Option<String> {
+        self.source_resolution
+            .as_ref()
+            .map(|resolution| format!("{}:{}", resolution.resolved_path, resolution.resolved_line))
+            .or_else(|| {
+                self.source.as_ref().and_then(|source| {
+                    let file = source.file.as_deref()?;
+                    let line = source.line?;
+                    Some(format!("{file}:{line}"))
+                })
+            })
     }
 }
 
@@ -245,6 +276,7 @@ impl BreakpointManager {
         label: String,
         resolved_symbol: Option<String>,
         source: Option<SourceLocation>,
+        source_resolution: Option<SourceBreakpointResolution>,
     ) -> Result<UserBreakpoint> {
         let id = UserBreakpointId(self.next_user_breakpoint_id.max(1));
         self.next_user_breakpoint_id = id.0 + 1;
@@ -257,6 +289,7 @@ impl BreakpointManager {
             label,
             resolved_symbol,
             source,
+            source_resolution,
         };
         self.user_breakpoints.insert(id, breakpoint.clone());
         self.add_owner(
